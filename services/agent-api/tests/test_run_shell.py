@@ -4,7 +4,7 @@ import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from threading import Event
 from time import monotonic, sleep
@@ -26,6 +26,103 @@ from resolveops.api.runs import (
 )
 from resolveops.models.contracts import WorkflowEventType
 from resolveops.repositories.runs import DatabaseRunRepository, LostExecutionLeaseError
+from resolveops.tools.contracts import (
+    CustomerRecord,
+    GetPaymentAttemptsInput,
+    GetPolicyInput,
+    GetSubscriptionInput,
+    InvoicePage,
+    InvoiceRecord,
+    ListInvoicesInput,
+    LookupCustomerInput,
+    PaymentAttemptPage,
+    PaymentAttemptRecord,
+    PolicyRecord,
+    SubscriptionRecord,
+)
+from resolveops.tools.read_only import ReadOnlyToolset
+
+TEST_NOW = datetime(2026, 7, 22, 12, tzinfo=UTC)
+TEST_ACCOUNT_ID = UUID("a2bf6866-a47b-5920-8ada-49d78c5d39f1")
+TEST_SUBSCRIPTION_ID = UUID("09615c4c-25ac-5d56-a6d1-6bbc4573e5e0")
+TEST_INVOICE_ID = UUID("5837ede5-6c6f-59e8-8cad-52fb7a66d25a")
+TEST_PAYMENT_ID = UUID("92c4c18e-51d4-5c66-9120-e26056a90e4d")
+TEST_POLICY_ID = UUID("62141d26-a9f1-5fb1-89bc-f3bd25cbf4a8")
+
+
+class DatabaseTestBackend:
+    """Deterministic synthetic transport used by database-backed route tests."""
+
+    def lookup_customer(self, request: LookupCustomerInput) -> CustomerRecord:
+        return CustomerRecord(
+            account_id=TEST_ACCOUNT_ID,
+            customer_reference=request.customer_reference,
+            name="AtlasFlow Test Organization",
+            region="us-west",
+            status="active",
+            created_at=TEST_NOW,
+        )
+
+    def get_subscription(self, request: GetSubscriptionInput) -> SubscriptionRecord:
+        return SubscriptionRecord(
+            subscription_id=TEST_SUBSCRIPTION_ID,
+            account_id=request.account_id,
+            plan="starter",
+            status="active",
+            amount_cents=4_900,
+            currency="USD",
+            current_period_start=date(2026, 7, 1),
+            current_period_end=date(2026, 8, 1),
+            plan_limit_units=1_000,
+            usage_units=900,
+            previous_plan="free",
+            upgraded_at=TEST_NOW,
+        )
+
+    def list_invoices(self, request: ListInvoicesInput) -> InvoicePage:
+        return InvoicePage(
+            items=[
+                InvoiceRecord(
+                    invoice_id=TEST_INVOICE_ID,
+                    account_id=request.account_id,
+                    subscription_id=TEST_SUBSCRIPTION_ID,
+                    period_start=date(2026, 7, 1),
+                    period_end=date(2026, 8, 1),
+                    amount_cents=4_900,
+                    currency="USD",
+                    status="paid",
+                    issued_at=TEST_NOW,
+                )
+            ]
+        )
+
+    def get_payment_attempts(self, request: GetPaymentAttemptsInput) -> PaymentAttemptPage:
+        return PaymentAttemptPage(
+            items=[
+                PaymentAttemptRecord(
+                    payment_attempt_id=TEST_PAYMENT_ID,
+                    account_id=request.account_id,
+                    invoice_id=request.invoice_id,
+                    amount_cents=4_900,
+                    currency="USD",
+                    status="succeeded",
+                    processor_reference="synthetic_test_payment",
+                    attempted_at=TEST_NOW,
+                )
+            ]
+        )
+
+    def get_policy(self, request: GetPolicyInput) -> PolicyRecord:
+        return PolicyRecord(
+            policy_id=TEST_POLICY_ID,
+            policy_key=request.policy_key,
+            version=request.version,
+            action_type="apply_account_credit",
+            maximum_amount_cents=10_000,
+            approval_required=True,
+            effective_at=TEST_NOW,
+            body="Synthetic test policy.",
+        )
 
 
 @dataclass(frozen=True)
@@ -111,7 +208,10 @@ def seeded_case(database_url: str) -> SeededCase:
 
 
 def _client(database_url: str, principal: Principal) -> TestClient:
-    application = create_app(DatabaseRunRepository(database_url))
+    application = create_app(
+        DatabaseRunRepository(database_url),
+        ReadOnlyToolset(DatabaseTestBackend(), now=lambda: TEST_NOW),
+    )
     application.dependency_overrides[require_principal] = lambda: principal
     return TestClient(application)
 
@@ -130,6 +230,27 @@ def _create_run(
     body = response.json()
     assert isinstance(body, dict)
     return body, response.headers["Idempotent-Replay"]
+
+
+def test_execute_fails_closed_when_synthetic_evidence_tools_are_unavailable() -> None:
+    principal = Principal(
+        organization_id=uuid4(),
+        user_id=uuid4(),
+        roles=frozenset({"operator"}),
+    )
+    application = create_app(
+        DatabaseRunRepository("postgresql+psycopg://resolveops:resolveops@127.0.0.1:1/unreachable")
+    )
+    application.dependency_overrides[require_principal] = lambda: principal
+
+    with TestClient(application) as client:
+        response = client.post(
+            f"/api/v1/runs/{uuid4()}/execute",
+            headers={"Idempotency-Key": str(uuid4())},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "synthetic evidence tools are unavailable"
 
 
 def test_run_creation_is_idempotent_and_uses_run_id_as_thread_id(
@@ -171,12 +292,8 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
         )
         assert response.status_code == 200, response.text
         assert response.headers["content-type"].startswith("text/event-stream")
-        assert [line for line in response.text.splitlines() if line.startswith("id: ")] == [
-            "id: 1",
-            "id: 2",
-            "id: 3",
-            "id: 4",
-        ]
+        event_ids = [line for line in response.text.splitlines() if line.startswith("id: ")]
+        assert event_ids == [f"id: {sequence}" for sequence in range(1, 26)]
 
         run_response = client.get(f"/api/v1/runs/{run_id}")
         assert run_response.status_code == 200
@@ -185,8 +302,8 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
 
         reconnect = client.get(f"/api/v1/runs/{run_id}/events?after_sequence=2")
         assert reconnect.status_code == 200
-        assert [event["sequence"] for event in reconnect.json()["events"]] == [3, 4]
-        assert reconnect.json()["last_sequence"] == 4
+        assert [event["sequence"] for event in reconnect.json()["events"]] == list(range(3, 26))
+        assert reconnect.json()["last_sequence"] == 25
 
         replay = client.post(
             f"/api/v1/runs/{run_id}/execute",
@@ -194,12 +311,30 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
         )
         assert replay.status_code == 200
         assert replay.headers["Idempotent-Replay"] == "true"
-        assert [line for line in replay.text.splitlines() if line.startswith("id: ")] == [
-            "id: 1",
-            "id: 2",
-            "id: 3",
-            "id: 4",
-        ]
+        assert [line for line in replay.text.splitlines() if line.startswith("id: ")] == event_ids
+
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT tool_call_id, tool_name, status, request_summary, response_summary
+            FROM app.tool_executions
+            WHERE run_id = %s
+            """,
+            (run_id,),
+        )
+        tool_attempts = cursor.fetchall()
+
+    assert len(tool_attempts) == 5
+    assert {attempt[1] for attempt in tool_attempts} == {
+        "lookup_customer",
+        "get_subscription",
+        "list_invoices",
+        "get_payment_attempts",
+        "get_policy",
+    }
+    assert all(str(attempt[0]).startswith("execution-1:") for attempt in tool_attempts)
+    assert all(attempt[2] == "completed" for attempt in tool_attempts)
+    assert all("body" not in attempt[3] and "body" not in attempt[4] for attempt in tool_attempts)
 
 
 def test_active_execution_lease_rejects_a_concurrent_executor(

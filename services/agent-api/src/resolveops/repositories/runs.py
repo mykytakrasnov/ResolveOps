@@ -13,11 +13,14 @@ from uuid import UUID, uuid4
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
-from pydantic import JsonValue
+from pydantic import BaseModel, JsonValue
 
 from resolveops.models.contracts import (
+    ReadToolName,
     RunError,
     RunStatus,
+    TicketInput,
+    ToolResult,
     WorkflowEvent,
     WorkflowEventType,
     WorkflowRun,
@@ -79,6 +82,12 @@ class ExecutionLease:
 class ExecutionStart:
     lease: ExecutionLease | None
     idempotent_replay: bool
+
+
+@dataclass(frozen=True)
+class RunCase:
+    ticket: TicketInput
+    created_at: datetime
 
 
 def _canonical_json(value: object) -> str:
@@ -265,6 +274,43 @@ class DatabaseRunRepository:
                 (run_id, after_sequence, EVENT_PAGE_SIZE),
             )
             return [_event_from_row(row) for row in cursor.fetchall()]
+
+    def get_run_case(
+        self,
+        *,
+        run_id: UUID,
+        organization_id: UUID,
+        actor_user_id: UUID,
+        allow_all: bool = False,
+    ) -> RunCase:
+        """Load only the public case input owned by the active run organization."""
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT support.subject, support.body, support.customer_reference,
+                       support.attachment_keys, support.created_at
+                FROM app.workflow_runs AS run
+                JOIN app.support_cases AS support
+                  ON support.id = run.case_id
+                 AND support.organization_id = run.organization_id
+                WHERE run.id = %s AND run.organization_id = %s
+                  AND (run.initiated_by = %s OR %s)
+                """,
+                (run_id, organization_id, actor_user_id, allow_all),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise RunNotFoundError("run not found")
+            return RunCase(
+                ticket=TicketInput(
+                    subject=row["subject"],
+                    body=row["body"],
+                    customer_reference=row["customer_reference"],
+                    attachments=row["attachment_keys"],
+                ),
+                created_at=row["created_at"],
+            )
 
     def acquire_execution_lease(
         self,
@@ -597,6 +643,101 @@ class DatabaseRunRepository:
                     (node_name, lease.run_id, lease.token),
                 )
             return _event_from_row(event_row)
+
+    def start_tool_attempt(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        tool_call_id: str,
+        tool_name: ReadToolName,
+        attempt: int,
+        request_summary: dict[str, str | int],
+    ) -> None:
+        """Persist a compact attempt record before invoking a read-only transport."""
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            self._lock_owned_lease(cursor, lease=lease, organization_id=organization_id)
+            cursor.execute(
+                """
+                INSERT INTO app.tool_executions (
+                    id, run_id, tool_call_id, tool_name, request_summary,
+                    attempt, status, started_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, 'running', CURRENT_TIMESTAMP)
+                """,
+                (
+                    uuid4(),
+                    lease.run_id,
+                    tool_call_id,
+                    tool_name.value,
+                    Jsonb(request_summary),
+                    attempt,
+                ),
+            )
+
+    def finish_tool_attempt(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        tool_call_id: str,
+        tool_name: ReadToolName,
+        result: ToolResult[BaseModel],
+        response_summary: dict[str, str | int | list[str]],
+    ) -> None:
+        """Complete exactly one persisted tool attempt with no raw response logging."""
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            self._lock_owned_lease(cursor, lease=lease, organization_id=organization_id)
+            cursor.execute(
+                """
+                UPDATE app.tool_executions
+                SET response_summary = %s,
+                    status = %s,
+                    error_code = %s,
+                    latency_ms = %s,
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE run_id = %s AND tool_call_id = %s
+                  AND tool_name = %s AND attempt = %s AND status = 'running'
+                """,
+                (
+                    Jsonb(response_summary),
+                    "completed" if result.ok else "failed",
+                    result.error_code,
+                    result.latency_ms,
+                    lease.run_id,
+                    tool_call_id,
+                    tool_name.value,
+                    result.attempt,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RunRepositoryError("tool attempt was not available for completion")
+
+    @staticmethod
+    def _lock_owned_lease(
+        cursor: psycopg.Cursor[dict[str, Any]],
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+    ) -> None:
+        cursor.execute(
+            """
+            SELECT execution_lease_token,
+                   execution_lease_until > CURRENT_TIMESTAMP AS lease_active
+            FROM app.workflow_runs
+            WHERE id = %s AND organization_id = %s
+            FOR UPDATE
+            """,
+            (lease.run_id, organization_id),
+        )
+        state = cursor.fetchone()
+        if (
+            state is None
+            or state["execution_lease_token"] != lease.token
+            or not state["lease_active"]
+        ):
+            raise LostExecutionLeaseError("execution lease is no longer owned by this executor")
 
 
 def _run_from_row(row: dict[str, Any]) -> WorkflowRun:

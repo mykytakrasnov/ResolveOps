@@ -41,6 +41,11 @@ const environment = {
     .join(path.delimiter),
   RESOLVEOPS_AGENT_API_URL: `http://127.0.0.1:${agentApiPort}`,
   RESOLVEOPS_SYNTHETIC_DATA_ROOT: generatedRoot,
+  SYNTHETIC_API_BASE_URL:
+    process.env.SYNTHETIC_API_BASE_URL ?? `http://127.0.0.1:${webPort}`,
+  SYNTHETIC_API_HMAC_SECRET:
+    process.env.SYNTHETIC_API_HMAC_SECRET ??
+    "resolveops-local-development-only",
 };
 
 function portIsAvailable(port) {

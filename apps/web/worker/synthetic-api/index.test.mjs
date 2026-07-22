@@ -222,6 +222,7 @@ test("local filesystem storage serves generated synthetic case routes", async ()
 test("service routes return typed CRM, billing, payment, policy, and status data", async () => {
   const api = createFixtureApi();
   const paths = [
+    "/systems/v1/crm/accounts?customer_reference=org_atlas_001",
     `/systems/v1/crm/accounts/${ACCOUNT_ID}`,
     `/systems/v1/billing/accounts/${ACCOUNT_ID}/subscription`,
     `/systems/v1/billing/accounts/${ACCOUNT_ID}/invoices?from=2026-07-01&to=2026-07-31&limit=25`,
@@ -235,14 +236,16 @@ test("service routes return typed CRM, billing, payment, policy, and status data
   );
   assert.deepEqual(
     responses.map((response) => response.status),
-    [200, 200, 200, 200, 200, 200],
+    [200, 200, 200, 200, 200, 200, 200],
   );
 
-  const account = await responses[0].json();
-  const invoices = await responses[2].json();
-  const attempts = await responses[3].json();
-  const policy = await responses[4].json();
-  const status = await responses[5].json();
+  const lookup = await responses[0].json();
+  const account = await responses[1].json();
+  const invoices = await responses[3].json();
+  const attempts = await responses[4].json();
+  const policy = await responses[5].json();
+  const status = await responses[6].json();
+  assert.equal(lookup.account_id, ACCOUNT_ID);
   assert.equal(account.account_id, ACCOUNT_ID);
   assert.equal(invoices.items[0].invoice_id, INVOICE_ID);
   assert.equal(attempts.items[0].account_id, ACCOUNT_ID);

@@ -628,6 +628,34 @@ export function createSyntheticApi(options: ApiOptions): {
     return jsonResponse(account);
   }
 
+  async function crmAccountLookup(url: URL): Promise<Response> {
+    rejectUnknownParameters(url.searchParams, ["customer_reference"]);
+    const customerReference = singleParameter(
+      url.searchParams,
+      "customer_reference",
+    );
+    if (
+      customerReference === null ||
+      !/^org_atlas_\d{3}$/.test(customerReference)
+    ) {
+      invalidQuery(
+        "Query parameter customer_reference is required and invalid.",
+      );
+    }
+    const accounts = await readObjects(
+      options.storage,
+      CRM_ACCOUNT_PREFIX,
+      parseCrmAccount,
+    );
+    const account = accounts.find(
+      (candidate) => candidate.customer_reference === customerReference,
+    );
+    if (account === undefined) {
+      notFound();
+    }
+    return jsonResponse(account);
+  }
+
   async function subscription(
     accountId: string,
     url: URL,
@@ -833,6 +861,9 @@ export function createSyntheticApi(options: ApiOptions): {
       notFound();
     }
     return crmAccount(accountId, new URL(context.req.url), context.req.raw);
+  });
+  app.get("/systems/v1/crm/accounts", (context) => {
+    return crmAccountLookup(new URL(context.req.url));
   });
   app.get("/systems/v1/billing/accounts/:accountId/subscription", (context) => {
     const accountId = context.req.param("accountId");

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
+from resolveops.graph.duplicate_charge import execute_duplicate_charge_graph
 from resolveops.models.contracts import RunStatus, WorkflowEvent, WorkflowEventType, WorkflowRun
 from resolveops.models.run_api import CreateRunRequest, CreateRunResponse, WorkflowEventPage
 from resolveops.repositories.runs import (
@@ -27,6 +28,7 @@ from resolveops.repositories.runs import (
     RunNotExecutableError,
     RunNotFoundError,
 )
+from resolveops.tools.read_only import ReadOnlyToolset
 
 LEASE_SECONDS = 60
 REPLAY_WAIT_SECONDS = LEASE_SECONDS + 1
@@ -166,11 +168,19 @@ def get_events(
 @router.post("/{run_id}/execute")
 def execute_run(
     run_id: UUID,
+    request: Request,
     principal: PrincipalDependency,
     repository: RepositoryDependency,
     idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
 ) -> StreamingResponse:
     """Persist the bounded shell timeline, then expose those durable rows as SSE."""
+
+    read_tools = getattr(request.app.state, "read_tools", None)
+    if not isinstance(read_tools, ReadOnlyToolset):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="synthetic evidence tools are unavailable",
+        )
 
     try:
         execution = repository.start_execution(
@@ -189,6 +199,7 @@ def execute_run(
                 repository=repository,
                 principal=principal,
                 lease=execution.lease,
+                read_tools=read_tools,
             )
             events = independent.events
             # Joining after the response body keeps the Lambda invocation alive even if
@@ -221,6 +232,7 @@ def _execute_shell(
     repository: DatabaseRunRepository,
     principal: Principal,
     lease: ExecutionLease,
+    read_tools: ReadOnlyToolset | None = None,
 ) -> Iterator[WorkflowEvent]:
     yield repository.append_event(
         lease=lease,
@@ -229,22 +241,38 @@ def _execute_shell(
         status="running",
         public_payload={"execution_attempt": lease.attempt},
     )
-    yield repository.append_event(
-        lease=lease,
-        organization_id=principal.organization_id,
-        event_type=WorkflowEventType.NODE_STARTED,
-        node_name=RUN_SHELL_NODE,
-        status="running",
-        public_payload={"summary": "Run shell initialization started."},
-    )
-    yield repository.append_event(
-        lease=lease,
-        organization_id=principal.organization_id,
-        event_type=WorkflowEventType.NODE_COMPLETED,
-        node_name=RUN_SHELL_NODE,
-        status="completed",
-        public_payload={"summary": "Run shell initialization completed."},
-    )
+    if read_tools is None:
+        yield repository.append_event(
+            lease=lease,
+            organization_id=principal.organization_id,
+            event_type=WorkflowEventType.NODE_STARTED,
+            node_name=RUN_SHELL_NODE,
+            status="running",
+            public_payload={"summary": "Run shell initialization started."},
+        )
+        yield repository.append_event(
+            lease=lease,
+            organization_id=principal.organization_id,
+            event_type=WorkflowEventType.NODE_COMPLETED,
+            node_name=RUN_SHELL_NODE,
+            status="completed",
+            public_payload={"summary": "Run shell initialization completed."},
+        )
+    else:
+        run_case = repository.get_run_case(
+            run_id=lease.run_id,
+            organization_id=principal.organization_id,
+            actor_user_id=principal.user_id,
+            allow_all=principal.can_access_all_runs,
+        )
+        yield from execute_duplicate_charge_graph(
+            tools=read_tools,
+            persistence=repository,
+            lease=lease,
+            organization_id=principal.organization_id,
+            ticket=run_case.ticket,
+            case_created_at=run_case.created_at,
+        )
     yield repository.append_event(
         lease=lease,
         organization_id=principal.organization_id,
@@ -263,6 +291,7 @@ def _start_independent_execution(
     repository: DatabaseRunRepository,
     principal: Principal,
     lease: ExecutionLease,
+    read_tools: ReadOnlyToolset | None = None,
 ) -> IndependentExecution:
     """Run persistence independently so a disconnected stream cannot cancel the run."""
 
@@ -274,6 +303,7 @@ def _start_independent_execution(
                 repository=repository,
                 principal=principal,
                 lease=lease,
+                read_tools=read_tools,
             ):
                 messages.put(event)
         except Exception as error:  # noqa: BLE001 - persist a safe terminal failure
