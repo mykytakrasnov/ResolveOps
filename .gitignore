@@ -21,3 +21,4 @@ __pycache__/
 # Generated local data is intentionally not versioned.
 data/generated/*
 !data/generated/.gitkeep
+data/run-artifacts/

@@ -75,6 +75,8 @@ the bounded demo operator and cases, and then supervises the Agent API and Vite 
 The Vite development gateway mounts the same validated synthetic case handlers used by the
 Cloudflare Worker and proxies durable run routes to the local Agent API. It reads only generated
 AtlasFlow fixtures and never enables real customer data or real side effects.
+Final JSON and Markdown reports are written privately under `data/run-artifacts/` by default;
+set `RESOLVEOPS_OBJECT_STORAGE_ROOT` to use a different local development directory.
 
 When neither database URL is configured, the command manages the repository's PostgreSQL
 container and automatically avoids an occupied default port. Setting `DATABASE_URL_POOLED` or

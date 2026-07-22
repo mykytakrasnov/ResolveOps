@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 
 from resolveops.api.runs import router as runs_router
 from resolveops.repositories.runs import DatabaseRunRepository
+from resolveops.storage.artifacts import LocalObjectStorage, ObjectStorage
 from resolveops.tools.read_only import ReadOnlyToolset
 from resolveops.tools.synthetic_api import SyntheticApiBackend
 
@@ -17,6 +19,7 @@ from resolveops.tools.synthetic_api import SyntheticApiBackend
 def create_app(
     repository: DatabaseRunRepository | None = None,
     read_tools: ReadOnlyToolset | None = None,
+    object_storage: ObjectStorage | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -38,6 +41,12 @@ def create_app(
                         hmac_secret=synthetic_api_hmac_secret,
                     )
                 )
+        if object_storage is not None:
+            application.state.object_storage = object_storage
+        else:
+            object_storage_root = os.getenv("RESOLVEOPS_OBJECT_STORAGE_ROOT")
+            if object_storage_root:
+                application.state.object_storage = LocalObjectStorage(Path(object_storage_root))
         yield
 
     application = FastAPI(title="ResolveOps Agent API", version="0.0.0", lifespan=lifespan)

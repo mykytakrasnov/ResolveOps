@@ -24,8 +24,14 @@ from resolveops.api.runs import (
     _start_independent_execution,
     require_principal,
 )
-from resolveops.models.contracts import WorkflowEventType
-from resolveops.repositories.runs import DatabaseRunRepository, LostExecutionLeaseError
+from resolveops.models.contracts import ArtifactKind, WorkflowEventType
+from resolveops.repositories.runs import (
+    DatabaseRunRepository,
+    ExecutionLease,
+    LostExecutionLeaseError,
+    RunRepositoryError,
+)
+from resolveops.storage.artifacts import InMemoryObjectStorage, StoredObject
 from resolveops.tools.contracts import (
     CustomerRecord,
     GetPaymentAttemptsInput,
@@ -211,6 +217,7 @@ def _client(database_url: str, principal: Principal) -> TestClient:
     application = create_app(
         DatabaseRunRepository(database_url),
         ReadOnlyToolset(DatabaseTestBackend(), now=lambda: TEST_NOW),
+        InMemoryObjectStorage(),
     )
     application.dependency_overrides[require_principal] = lambda: principal
     return TestClient(application)
@@ -253,6 +260,53 @@ def test_execute_fails_closed_when_synthetic_evidence_tools_are_unavailable() ->
     assert response.json()["detail"] == "synthetic evidence tools are unavailable"
 
 
+def test_execute_fails_closed_when_run_artifact_storage_is_unavailable() -> None:
+    principal = Principal(
+        organization_id=uuid4(),
+        user_id=uuid4(),
+        roles=frozenset({"operator"}),
+    )
+    application = create_app(
+        DatabaseRunRepository("postgresql+psycopg://resolveops:resolveops@127.0.0.1:1/unreachable"),
+        ReadOnlyToolset(DatabaseTestBackend(), now=lambda: TEST_NOW),
+    )
+    application.dependency_overrides[require_principal] = lambda: principal
+
+    with TestClient(application) as client:
+        response = client.post(
+            f"/api/v1/runs/{uuid4()}/execute",
+            headers={"Idempotency-Key": str(uuid4())},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "run artifact storage is unavailable"
+
+
+def test_artifact_metadata_must_match_the_active_run_and_kind() -> None:
+    repository = DatabaseRunRepository(
+        "postgresql+psycopg://resolveops:resolveops@127.0.0.1:1/unreachable"
+    )
+    lease = ExecutionLease(
+        run_id=uuid4(),
+        token=uuid4(),
+        attempt=1,
+        expires_at=TEST_NOW,
+    )
+
+    with pytest.raises(RunRepositoryError, match="active run and kind"):
+        repository.record_artifact(
+            lease=lease,
+            organization_id=uuid4(),
+            kind=ArtifactKind.JSON_REPORT,
+            stored_object=StoredObject(
+                object_key=f"runs/{uuid4()}/report.json",
+                mime_type="application/json",
+                sha256="0" * 64,
+                size_bytes=2,
+            ),
+        )
+
+
 def test_run_creation_is_idempotent_and_uses_run_id_as_thread_id(
     database_url: str,
     seeded_case: SeededCase,
@@ -275,6 +329,60 @@ def test_run_creation_is_idempotent_and_uses_run_id_as_thread_id(
     assert conflict.status_code == 409
 
 
+def test_artifact_metadata_upsert_is_replay_safe(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    repository = DatabaseRunRepository(database_url)
+    created = repository.create_run(
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        case_id=seeded_case.case_id,
+        idempotency_key=uuid4(),
+    )
+    lease = repository.acquire_execution_lease(
+        run_id=created.run.run_id,
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        lease_seconds=60,
+    )
+    storage = InMemoryObjectStorage()
+    first_object = storage.put_object(
+        object_key=f"runs/{created.run.run_id}/report.json",
+        content=b'{"version":1}\n',
+        mime_type="application/json",
+    )
+    replay_object = storage.put_object(
+        object_key=f"runs/{created.run.run_id}/report.json",
+        content=b'{"version":2}\n',
+        mime_type="application/json",
+    )
+
+    first = repository.record_artifact(
+        lease=lease,
+        organization_id=seeded_case.principal.organization_id,
+        kind=ArtifactKind.JSON_REPORT,
+        stored_object=first_object,
+    )
+    replay = repository.record_artifact(
+        lease=lease,
+        organization_id=seeded_case.principal.organization_id,
+        kind=ArtifactKind.JSON_REPORT,
+        stored_object=replay_object,
+    )
+
+    assert replay.artifact_id == first.artifact_id
+    assert replay.sha256 == replay_object.sha256
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM app.run_artifacts WHERE run_id = %s AND kind = %s",
+            (created.run.run_id, ArtifactKind.JSON_REPORT.value),
+        )
+        count_row = cursor.fetchone()
+        assert count_row is not None
+        assert count_row[0] == 1
+
+
 def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
     database_url: str,
     seeded_case: SeededCase,
@@ -293,7 +401,7 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
         assert response.status_code == 200, response.text
         assert response.headers["content-type"].startswith("text/event-stream")
         event_ids = [line for line in response.text.splitlines() if line.startswith("id: ")]
-        assert event_ids == [f"id: {sequence}" for sequence in range(1, 36)]
+        assert event_ids == [f"id: {sequence}" for sequence in range(1, 40)]
 
         run_response = client.get(f"/api/v1/runs/{run_id}")
         assert run_response.status_code == 200
@@ -302,8 +410,8 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
 
         reconnect = client.get(f"/api/v1/runs/{run_id}/events?after_sequence=2")
         assert reconnect.status_code == 200
-        assert [event["sequence"] for event in reconnect.json()["events"]] == list(range(3, 36))
-        assert reconnect.json()["last_sequence"] == 35
+        assert [event["sequence"] for event in reconnect.json()["events"]] == list(range(3, 40))
+        assert reconnect.json()["last_sequence"] == 39
 
         replay = client.post(
             f"/api/v1/runs/{run_id}/execute",
@@ -323,6 +431,16 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
             (run_id,),
         )
         tool_attempts = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT kind, object_key, mime_type, sha256, size_bytes
+            FROM app.run_artifacts
+            WHERE run_id = %s
+            ORDER BY kind
+            """,
+            (run_id,),
+        )
+        artifacts = cursor.fetchall()
 
     assert len(tool_attempts) == 5
     assert {attempt[1] for attempt in tool_attempts} == {
@@ -335,6 +453,9 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
     assert all(str(attempt[0]).startswith("execution-1:") for attempt in tool_attempts)
     assert all(attempt[2] == "completed" for attempt in tool_attempts)
     assert all("body" not in attempt[3] and "body" not in attempt[4] for attempt in tool_attempts)
+    assert {artifact[0] for artifact in artifacts} == {"json_report", "markdown_brief"}
+    assert all(str(artifact[1]).startswith(f"runs/{run_id}/report.") for artifact in artifacts)
+    assert all(len(artifact[3]) == 64 and artifact[4] > 0 for artifact in artifacts)
 
 
 def test_active_execution_lease_rejects_a_concurrent_executor(

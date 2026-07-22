@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, JsonValue
 
-from resolveops.api.runs import Principal, _execute_shell
+from resolveops.api.runs import Principal, _execute_shell, _start_independent_execution
 from resolveops.graph.duplicate_charge import (
     CLASSIFY_CASE,
     COLLECT_INITIAL_EVIDENCE,
@@ -21,8 +21,10 @@ from resolveops.graph.duplicate_charge import (
 )
 from resolveops.graph.state import DuplicateChargeState
 from resolveops.models.contracts import (
+    ArtifactKind,
     ReadToolName,
     RiskLevel,
+    RunArtifact,
     RunStatus,
     TicketInput,
     ToolResult,
@@ -36,6 +38,7 @@ from resolveops.policies.duplicate_charge import (
     verify_evidence,
 )
 from resolveops.repositories.runs import DatabaseRunRepository, ExecutionLease, RunCase
+from resolveops.storage.artifacts import InMemoryObjectStorage, StoredObject
 from resolveops.tools.contracts import (
     CustomerRecord,
     GetPaymentAttemptsInput,
@@ -152,6 +155,12 @@ class MissingPolicyBackend(FakeBackend):
         raise ValueError(f"missing synthetic policy {request.policy_key}")
 
 
+class UnavailableCustomerBackend(FakeBackend):
+    def lookup_customer(self, request: LookupCustomerInput) -> CustomerRecord:
+        self.calls.append(ReadToolName.LOOKUP_CUSTOMER)
+        raise ValueError(f"missing synthetic customer {request.customer_reference}")
+
+
 class OnePaymentBackend(FakeBackend):
     def get_payment_attempts(self, request: GetPaymentAttemptsInput) -> PaymentAttemptPage:
         self.calls.append(ReadToolName.GET_PAYMENT_ATTEMPTS)
@@ -213,6 +222,8 @@ class FakePersistence:
     def __init__(self) -> None:
         self.events: list[WorkflowEvent] = []
         self.attempts: list[dict[str, Any]] = []
+        self.artifacts: list[RunArtifact] = []
+        self.storage = InMemoryObjectStorage()
 
     def append_event(
         self,
@@ -295,6 +306,34 @@ class FakePersistence:
             created_at=NOW,
         )
 
+    def record_artifact(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        kind: ArtifactKind,
+        stored_object: StoredObject,
+    ) -> RunArtifact:
+        assert organization_id == ORGANIZATION_ID
+        artifact = RunArtifact(
+            artifact_id=UUID(int=len(self.artifacts) + 1),
+            run_id=lease.run_id,
+            kind=kind,
+            object_key=stored_object.object_key,
+            mime_type=stored_object.mime_type,
+            sha256=stored_object.sha256,
+            size_bytes=stored_object.size_bytes,
+            created_at=NOW,
+        )
+        self.artifacts.append(artifact)
+        return artifact
+
+
+class FailingObjectStorage:
+    def put_object(self, **kwargs: object) -> StoredObject:
+        del kwargs
+        raise RuntimeError("synthetic artifact write failure")
+
 
 def invoke_graph(backend: FakeBackend) -> tuple[DuplicateChargeState, FakePersistence]:
     persistence = FakePersistence()
@@ -307,6 +346,7 @@ def invoke_graph(backend: FakeBackend) -> tuple[DuplicateChargeState, FakePersis
     graph = build_duplicate_charge_graph(
         tools=ReadOnlyToolset(backend, now=lambda: NOW),
         persistence=persistence,
+        object_storage=persistence.storage,
         lease=lease,
         organization_id=ORGANIZATION_ID,
     )
@@ -338,6 +378,7 @@ def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_even
     graph = build_duplicate_charge_graph(
         tools=ReadOnlyToolset(backend, now=lambda: NOW),
         persistence=persistence,
+        object_storage=persistence.storage,
         lease=lease,
         organization_id=ORGANIZATION_ID,
     )
@@ -373,6 +414,7 @@ def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_even
     ]
     assert backend.calls == result["investigation_plan"].required_tools
     assert {item.evidence_id for item in result["evidence"]} == {
+        f"case_report:{RUN_ID}",
         f"crm:{ACCOUNT_ID}",
         f"subscription:{SUBSCRIPTION_ID}",
         f"invoice:{INVOICE_ID}",
@@ -401,7 +443,7 @@ def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_even
     event_types = [event.event_type for event in persistence.events]
     assert event_types.count(WorkflowEventType.TOOL_STARTED) == 5
     assert event_types.count(WorkflowEventType.TOOL_COMPLETED) == 5
-    assert event_types.count(WorkflowEventType.EVIDENCE_ADDED) == 6
+    assert event_types.count(WorkflowEventType.EVIDENCE_ADDED) == 7
     assert event_types.count(WorkflowEventType.EVIDENCE_VERIFIED) == 1
     assert event_types.count(WorkflowEventType.POLICY_EVALUATED) == 1
     public_payloads = [event.public_payload for event in persistence.events]
@@ -416,7 +458,7 @@ def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_even
 
 
 def test_run_shell_publishes_only_events_already_recorded_by_graph_persistence() -> None:
-    backend = FakeBackend()
+    backend = OnePaymentBackend()
     persistence = FakePersistence()
     lease = ExecutionLease(
         run_id=RUN_ID,
@@ -435,6 +477,7 @@ def test_run_shell_publishes_only_events_already_recorded_by_graph_persistence()
             ),
             lease=lease,
             read_tools=ReadOnlyToolset(backend, now=lambda: NOW),
+            object_storage=persistence.storage,
         )
     )
 
@@ -464,15 +507,56 @@ def test_missing_policy_evidence_routes_to_escalation() -> None:
         if event.event_type is WorkflowEventType.EVIDENCE_VERIFIED
     )
     assert verified_event.public_payload["verified"] is False
+    assert result["final_response"].uncertainty_disclosure is not None
+    assert "specialist" in result["final_response"].body.lower()
+    assert {artifact.kind for artifact in persistence.artifacts} == {
+        ArtifactKind.JSON_REPORT,
+        ArtifactKind.MARKDOWN_BRIEF,
+    }
+    assert any(event.event_type is WorkflowEventType.MODEL_FALLBACK for event in persistence.events)
+
+
+def test_total_tool_outage_escalates_with_a_cited_case_report() -> None:
+    result, persistence = invoke_graph(UnavailableCustomerBackend())
+
+    assert result["workflow_outcome"] is WorkflowOutcome.ESCALATE
+    assert result["evidence_verification"].verified is False
+    assert result["final_response"].cited_evidence_ids == [f"case_report:{RUN_ID}"]
+    assert "specialist" in result["final_response"].body.lower()
+    assert {artifact.kind for artifact in persistence.artifacts} == {
+        ArtifactKind.JSON_REPORT,
+        ArtifactKind.MARKDOWN_BRIEF,
+    }
 
 
 def test_complete_non_duplicate_evidence_routes_to_no_action() -> None:
-    result, _ = invoke_graph(OnePaymentBackend())
+    result, persistence = invoke_graph(OnePaymentBackend())
 
     assert result["evidence_verification"].verified is True
     assert result["duplicate_charge_validation"].confirmed is False
     assert result["policy_decision"].outcome is WorkflowOutcome.NO_ACTION
     assert result["workflow_outcome"] is WorkflowOutcome.NO_ACTION
+    assert "did not make an account change" in result["final_response"].body
+    assert result["final_response"].internal_case_note
+    assert result["final_response"].uncertainty_disclosure is not None
+    assert set(result["final_response"].cited_evidence_ids).issubset(
+        {item.evidence_id for item in result["evidence"]}
+    )
+    json_object = persistence.storage.objects[f"runs/{RUN_ID}/report.json"]
+    report = json.loads(json_object.content)
+    assert report["workflow_outcome"] == "no_action"
+    assert report["final_response"]["cited_evidence_ids"]
+    markdown = persistence.storage.objects[f"runs/{RUN_ID}/report.md"].content.decode()
+    assert "## Customer response" in markdown
+    assert "## Evidence citations" in markdown
+    assert {artifact.kind for artifact in persistence.artifacts} == {
+        ArtifactKind.JSON_REPORT,
+        ArtifactKind.MARKDOWN_BRIEF,
+    }
+    for artifact in persistence.artifacts:
+        stored = persistence.storage.objects[artifact.object_key]
+        assert artifact.sha256 == stored.sha256
+        assert artifact.size_bytes == stored.size_bytes
 
 
 def test_hallucinated_evidence_id_and_unsupported_fact_are_rejected() -> None:
@@ -642,8 +726,74 @@ def test_run_shell_persists_escalation_as_the_terminal_outcome() -> None:
             ),
             lease=lease,
             read_tools=ReadOnlyToolset(MissingPolicyBackend(), now=lambda: NOW),
+            object_storage=persistence.storage,
         )
     )
 
     assert yielded[-1].event_type is WorkflowEventType.RUN_ESCALATED
     assert WorkflowEventType.RUN_COMPLETED not in {event.event_type for event in yielded}
+    assert yielded[-1].sequence == len(yielded)
+    assert yielded[-1].payload_hash
+
+
+def test_approval_required_is_not_finalized_as_successful() -> None:
+    persistence = FakePersistence()
+    lease = ExecutionLease(
+        run_id=RUN_ID,
+        token=UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        attempt=1,
+        expires_at=NOW + timedelta(minutes=1),
+    )
+
+    yielded = list(
+        _execute_shell(
+            repository=cast(DatabaseRunRepository, persistence),
+            principal=Principal(
+                organization_id=ORGANIZATION_ID,
+                user_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+                roles=frozenset({"operator"}),
+            ),
+            lease=lease,
+            read_tools=ReadOnlyToolset(FakeBackend(), now=lambda: NOW),
+            object_storage=persistence.storage,
+        )
+    )
+
+    assert yielded[-1].event_type is WorkflowEventType.RUN_FAILED
+    assert yielded[-1].public_payload == {
+        "error_code": "approval_flow_not_implemented",
+        "recoverable": True,
+        "workflow_outcome": "approval_required",
+    }
+    assert WorkflowEventType.RUN_COMPLETED not in {event.event_type for event in yielded}
+    assert persistence.artifacts == []
+
+
+def test_report_write_failure_emits_a_recoverable_run_failed_event() -> None:
+    persistence = FakePersistence()
+    lease = ExecutionLease(
+        run_id=RUN_ID,
+        token=UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        attempt=1,
+        expires_at=NOW + timedelta(minutes=1),
+    )
+
+    independent = _start_independent_execution(
+        repository=cast(DatabaseRunRepository, persistence),
+        principal=Principal(
+            organization_id=ORGANIZATION_ID,
+            user_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+            roles=frozenset({"operator"}),
+        ),
+        lease=lease,
+        read_tools=ReadOnlyToolset(OnePaymentBackend(), now=lambda: NOW),
+        object_storage=FailingObjectStorage(),
+    )
+    frames = list(independent.events)
+
+    assert persistence.events[-1].event_type is WorkflowEventType.RUN_FAILED
+    assert persistence.events[-1].public_payload == {
+        "error_code": "run_shell_failed",
+        "recoverable": True,
+    }
+    assert "run.failed" in frames[-1]

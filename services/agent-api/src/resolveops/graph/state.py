@@ -11,8 +11,10 @@ from resolveops.models.contracts import (
     DuplicateChargeValidation,
     EvidenceItem,
     EvidenceVerification,
+    FinalResponse,
     InvestigationPlan,
     PolicyDecision,
+    RunArtifact,
     TicketInput,
     WorkflowEvent,
     WorkflowOutcome,
@@ -33,5 +35,7 @@ class DuplicateChargeState(TypedDict, total=False):
     evidence_verification: EvidenceVerification
     duplicate_charge_validation: DuplicateChargeValidation
     policy_decision: PolicyDecision
+    final_response: FinalResponse
+    finalized_artifacts: list[RunArtifact]
     workflow_outcome: WorkflowOutcome
     emitted_events: Annotated[list[WorkflowEvent], add]

@@ -34,6 +34,7 @@ from resolveops.repositories.runs import (
     RunNotExecutableError,
     RunNotFoundError,
 )
+from resolveops.storage.artifacts import ObjectStorage
 from resolveops.tools.read_only import ReadOnlyToolset
 
 LEASE_SECONDS = 60
@@ -187,6 +188,12 @@ def execute_run(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="synthetic evidence tools are unavailable",
         )
+    object_storage = getattr(request.app.state, "object_storage", None)
+    if not isinstance(object_storage, ObjectStorage):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="run artifact storage is unavailable",
+        )
 
     try:
         execution = repository.start_execution(
@@ -206,6 +213,7 @@ def execute_run(
                 principal=principal,
                 lease=execution.lease,
                 read_tools=read_tools,
+                object_storage=object_storage,
             )
             events = independent.events
             # Joining after the response body keeps the Lambda invocation alive even if
@@ -239,6 +247,7 @@ def _execute_shell(
     principal: Principal,
     lease: ExecutionLease,
     read_tools: ReadOnlyToolset | None = None,
+    object_storage: ObjectStorage | None = None,
 ) -> Iterator[WorkflowEvent]:
     workflow_outcome: WorkflowOutcome | None = None
     outcome_reason_code: str | None = None
@@ -267,6 +276,8 @@ def _execute_shell(
             public_payload={"summary": "Run shell initialization completed."},
         )
     else:
+        if object_storage is None:
+            raise RuntimeError("run artifact storage is required for graph execution")
         run_case = repository.get_run_case(
             run_id=lease.run_id,
             organization_id=principal.organization_id,
@@ -276,6 +287,7 @@ def _execute_shell(
         graph_events = execute_duplicate_charge_graph(
             tools=read_tools,
             persistence=repository,
+            object_storage=object_storage,
             lease=lease,
             organization_id=principal.organization_id,
             ticket=run_case.ticket,
@@ -296,8 +308,24 @@ def _execute_shell(
             public_payload={
                 "summary": "Investigation escalated after deterministic review.",
                 "reason_code": outcome_reason_code or "policy_escalation",
+                "report_status": "generated",
             },
             final_status=RunStatus.ESCALATED,
+        )
+        return
+    if workflow_outcome is WorkflowOutcome.APPROVAL_REQUIRED:
+        yield repository.append_event(
+            lease=lease,
+            organization_id=principal.organization_id,
+            event_type=WorkflowEventType.RUN_FAILED,
+            status="failed",
+            public_payload={
+                "error_code": "approval_flow_not_implemented",
+                "recoverable": True,
+                "workflow_outcome": WorkflowOutcome.APPROVAL_REQUIRED.value,
+            },
+            final_status=RunStatus.FAILED,
+            final_error_code="approval_flow_not_implemented",
         )
         return
     yield repository.append_event(
@@ -306,7 +334,7 @@ def _execute_shell(
         event_type=WorkflowEventType.RUN_COMPLETED,
         status="completed",
         public_payload={
-            "report_status": "not_generated",
+            "report_status": "generated" if workflow_outcome else "not_generated",
             "workflow_outcome": workflow_outcome.value if workflow_outcome else "shell_only",
         },
         final_status=RunStatus.COMPLETED,
@@ -322,6 +350,7 @@ def _start_independent_execution(
     principal: Principal,
     lease: ExecutionLease,
     read_tools: ReadOnlyToolset | None = None,
+    object_storage: ObjectStorage | None = None,
 ) -> IndependentExecution:
     """Run persistence independently so a disconnected stream cannot cancel the run."""
 
@@ -334,6 +363,7 @@ def _start_independent_execution(
                 principal=principal,
                 lease=lease,
                 read_tools=read_tools,
+                object_storage=object_storage,
             ):
                 messages.put(event)
         except Exception as error:  # noqa: BLE001 - persist a safe terminal failure

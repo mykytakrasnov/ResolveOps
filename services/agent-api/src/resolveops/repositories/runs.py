@@ -16,7 +16,9 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel, JsonValue
 
 from resolveops.models.contracts import (
+    ArtifactKind,
     ReadToolName,
+    RunArtifact,
     RunError,
     RunStatus,
     TicketInput,
@@ -25,6 +27,7 @@ from resolveops.models.contracts import (
     WorkflowEventType,
     WorkflowRun,
 )
+from resolveops.storage.artifacts import StoredObject
 
 GRAPH_VERSION = "1.0.0"
 PROMPT_BUNDLE_VERSION = "1.0.0"
@@ -34,6 +37,7 @@ EVENT_PAGE_SIZE = 500
 DB_CONNECT_TIMEOUT_SECONDS = 5
 DB_STATEMENT_TIMEOUT_MILLISECONDS = 10_000
 DB_LOCK_TIMEOUT_MILLISECONDS = 5_000
+RECOVERABLE_RUN_ERROR_CODES = frozenset({"run_shell_failed", "approval_flow_not_implemented"})
 
 
 class RunRepositoryError(Exception):
@@ -644,6 +648,90 @@ class DatabaseRunRepository:
                 )
             return _event_from_row(event_row)
 
+    def record_artifact(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        kind: ArtifactKind,
+        stored_object: StoredObject,
+    ) -> RunArtifact:
+        """Upsert stable run artifact metadata while the executor still owns the lease."""
+
+        expected_metadata = {
+            ArtifactKind.JSON_REPORT: (
+                f"runs/{lease.run_id}/report.json",
+                "application/json",
+            ),
+            ArtifactKind.MARKDOWN_BRIEF: (
+                f"runs/{lease.run_id}/report.md",
+                "text/markdown; charset=utf-8",
+            ),
+        }.get(kind)
+        if expected_metadata != (stored_object.object_key, stored_object.mime_type):
+            raise RunRepositoryError("artifact metadata does not match the active run and kind")
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            self._lock_owned_lease(cursor, lease=lease, organization_id=organization_id)
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"run-artifact:{lease.run_id}:{kind.value}",),
+            )
+            cursor.execute(
+                """
+                SELECT id
+                FROM app.run_artifacts
+                WHERE run_id = %s AND kind = %s
+                FOR UPDATE
+                """,
+                (lease.run_id, kind.value),
+            )
+            existing = cursor.fetchone()
+            if existing is None:
+                artifact_id = uuid4()
+                cursor.execute(
+                    """
+                    INSERT INTO app.run_artifacts (
+                        id, run_id, kind, object_key, mime_type, sha256, size_bytes
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id, run_id, kind, object_key, mime_type, sha256,
+                              size_bytes, created_at
+                    """,
+                    (
+                        artifact_id,
+                        lease.run_id,
+                        kind.value,
+                        stored_object.object_key,
+                        stored_object.mime_type,
+                        stored_object.sha256,
+                        stored_object.size_bytes,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE app.run_artifacts
+                    SET object_key = %s,
+                        mime_type = %s,
+                        sha256 = %s,
+                        size_bytes = %s
+                    WHERE id = %s
+                    RETURNING id, run_id, kind, object_key, mime_type, sha256,
+                              size_bytes, created_at
+                    """,
+                    (
+                        stored_object.object_key,
+                        stored_object.mime_type,
+                        stored_object.sha256,
+                        stored_object.size_bytes,
+                        existing["id"],
+                    ),
+                )
+            row = cursor.fetchone()
+            if row is None:  # pragma: no cover - INSERT/UPDATE RETURNING contract
+                raise RunRepositoryError("artifact persistence returned no row")
+            return _artifact_from_row(row)
+
     def start_tool_attempt(
         self,
         *,
@@ -746,7 +834,7 @@ def _run_from_row(row: dict[str, Any]) -> WorkflowRun:
         last_error = RunError(
             code=row["last_error_code"],
             message="The run ended with a safe workflow error.",
-            recoverable=row["last_error_code"] == "run_shell_failed",
+            recoverable=row["last_error_code"] in RECOVERABLE_RUN_ERROR_CODES,
         )
     cost = row["cost_usd"]
     return WorkflowRun(
@@ -782,5 +870,18 @@ def _event_from_row(row: dict[str, Any]) -> WorkflowEvent:
         status=row["status"],
         public_payload=row["public_payload"],
         payload_hash=row["payload_hash"],
+        created_at=row["created_at"],
+    )
+
+
+def _artifact_from_row(row: dict[str, Any]) -> RunArtifact:
+    return RunArtifact(
+        artifact_id=row["id"],
+        run_id=row["run_id"],
+        kind=row["kind"],
+        object_key=row["object_key"],
+        mime_type=row["mime_type"],
+        sha256=row["sha256"],
+        size_bytes=row["size_bytes"],
         created_at=row["created_at"],
     )

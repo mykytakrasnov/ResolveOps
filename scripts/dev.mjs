@@ -29,6 +29,7 @@ const databaseUrlDirect = process.env.DATABASE_URL_DIRECT ?? databaseUrlPooled;
 const agentApiPort = process.env.RESOLVEOPS_AGENT_API_PORT ?? "8000";
 const webPort = process.env.RESOLVEOPS_WEB_PORT ?? "5173";
 const generatedRoot = path.join(repositoryRoot, "data/generated");
+const objectStorageRoot = path.join(repositoryRoot, "data/run-artifacts");
 const pythonSource = path.join(repositoryRoot, "services/agent-api/src");
 
 const environment = {
@@ -40,6 +41,8 @@ const environment = {
     .filter(Boolean)
     .join(path.delimiter),
   RESOLVEOPS_AGENT_API_URL: `http://127.0.0.1:${agentApiPort}`,
+  RESOLVEOPS_OBJECT_STORAGE_ROOT:
+    process.env.RESOLVEOPS_OBJECT_STORAGE_ROOT ?? objectStorageRoot,
   RESOLVEOPS_SYNTHETIC_DATA_ROOT: generatedRoot,
   SYNTHETIC_API_BASE_URL:
     process.env.SYNTHETIC_API_BASE_URL ?? `http://127.0.0.1:${webPort}`,

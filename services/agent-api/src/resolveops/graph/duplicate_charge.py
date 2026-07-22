@@ -15,14 +15,17 @@ from pydantic import BaseModel, JsonValue
 
 from resolveops.graph.state import DuplicateChargeState
 from resolveops.models.contracts import (
+    ArtifactKind,
     CaseCategory,
     CaseClassification,
     EvidenceClaim,
     EvidenceItem,
+    FinalResponse,
     InvestigationPlan,
     PolicyDecision,
     ReadToolName,
     RiskIndicator,
+    RunArtifact,
     SourceSystem,
     TicketInput,
     ToolResult,
@@ -37,6 +40,7 @@ from resolveops.policies.duplicate_charge import (
     verify_evidence,
 )
 from resolveops.repositories.runs import ExecutionLease
+from resolveops.storage.artifacts import ObjectStorage, StoredObject
 from resolveops.tools.contracts import (
     CustomerRecord,
     GetPaymentAttemptsInput,
@@ -61,7 +65,8 @@ VERIFY_EVIDENCE = "verify_evidence"
 VALIDATE_DUPLICATE_CHARGE = "validate_duplicate_charge"
 ENFORCE_POLICY = "enforce_policy"
 ESCALATE_CASE = "escalate_case"
-DRAFT_NO_ACTION = "draft_no_action"
+DRAFT_RESPONSE = "draft_response"
+FINALIZE_RUN = "finalize_run"
 REQUEST_APPROVAL = "request_approval"
 DUPLICATE_CHARGE_RECIPE = "duplicate_charge_v1"
 BILLING_POLICY_KEY = "billing_duplicate_credit"
@@ -102,6 +107,15 @@ class WorkflowPersistence(Protocol):
         result: ToolResult[BaseModel],
         response_summary: dict[str, str | int | list[str]],
     ) -> None: ...
+
+    def record_artifact(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        kind: ArtifactKind,
+        stored_object: StoredObject,
+    ) -> RunArtifact: ...
 
 
 class _PersistingObserver(ToolAttemptObserver):
@@ -201,6 +215,7 @@ def build_duplicate_charge_graph(
     *,
     tools: ReadOnlyToolset,
     persistence: WorkflowPersistence,
+    object_storage: ObjectStorage,
     lease: ExecutionLease,
     organization_id: UUID,
 ) -> CompiledStateGraph[DuplicateChargeState, None, Any, Any]:
@@ -295,7 +310,6 @@ def build_duplicate_charge_graph(
     )
     for node_name, operation in (
         (ESCALATE_CASE, _escalate_case),
-        (DRAFT_NO_ACTION, _draft_no_action),
         (REQUEST_APPROVAL, _request_approval),
     ):
         graph.add_node(
@@ -311,6 +325,29 @@ def build_duplicate_charge_graph(
                 ),
             ),
         )
+    graph.add_node(
+        DRAFT_RESPONSE,
+        cast(
+            Any,
+            _draft_response_node(
+                persistence=persistence,
+                lease=lease,
+                organization_id=organization_id,
+            ),
+        ),
+    )
+    graph.add_node(
+        FINALIZE_RUN,
+        cast(
+            Any,
+            _finalize_node(
+                persistence=persistence,
+                object_storage=object_storage,
+                lease=lease,
+                organization_id=organization_id,
+            ),
+        ),
+    )
     graph.add_edge(START, NORMALIZE_INPUT)
     graph.add_edge(NORMALIZE_INPUT, CLASSIFY_CASE)
     graph.add_edge(CLASSIFY_CASE, SELECT_INVESTIGATION_RECIPE)
@@ -323,12 +360,13 @@ def build_duplicate_charge_graph(
         _route_policy_outcome,
         {
             WorkflowOutcome.ESCALATE.value: ESCALATE_CASE,
-            WorkflowOutcome.NO_ACTION.value: DRAFT_NO_ACTION,
+            WorkflowOutcome.NO_ACTION.value: DRAFT_RESPONSE,
             WorkflowOutcome.APPROVAL_REQUIRED.value: REQUEST_APPROVAL,
         },
     )
-    graph.add_edge(ESCALATE_CASE, END)
-    graph.add_edge(DRAFT_NO_ACTION, END)
+    graph.add_edge(ESCALATE_CASE, DRAFT_RESPONSE)
+    graph.add_edge(DRAFT_RESPONSE, FINALIZE_RUN)
+    graph.add_edge(FINALIZE_RUN, END)
     graph.add_edge(REQUEST_APPROVAL, END)
     return graph.compile()
 
@@ -337,6 +375,7 @@ def execute_duplicate_charge_graph(
     *,
     tools: ReadOnlyToolset,
     persistence: WorkflowPersistence,
+    object_storage: ObjectStorage,
     lease: ExecutionLease,
     organization_id: UUID,
     ticket: TicketInput,
@@ -345,6 +384,7 @@ def execute_duplicate_charge_graph(
     graph = build_duplicate_charge_graph(
         tools=tools,
         persistence=persistence,
+        object_storage=object_storage,
         lease=lease,
         organization_id=organization_id,
     )
@@ -474,13 +514,15 @@ def _collect_node(
                 public_payload={"summary": "collect_initial_evidence started."},
             )
         ]
+        case_report = _case_report_evidence(state)
         observer = _PersistingObserver(
             persistence=persistence,
             lease=lease,
             organization_id=organization_id,
             events=events,
         )
-        evidence, errors, account_id, invoice_ids = _collect_evidence(state, tools, observer)
+        collected, errors, account_id, invoice_ids = _collect_evidence(state, tools, observer)
+        evidence = [case_report, *collected]
         for item in evidence:
             events.append(
                 persistence.append_event(
@@ -649,14 +691,225 @@ def _escalate_case(state: DuplicateChargeState) -> DuplicateChargeState:
     return {"workflow_outcome": WorkflowOutcome.ESCALATE}
 
 
-def _draft_no_action(state: DuplicateChargeState) -> DuplicateChargeState:
-    del state
-    return {"workflow_outcome": WorkflowOutcome.NO_ACTION}
-
-
 def _request_approval(state: DuplicateChargeState) -> DuplicateChargeState:
     del state
     return {"workflow_outcome": WorkflowOutcome.APPROVAL_REQUIRED}
+
+
+def _draft_response_node(
+    *,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+    def node(state: DuplicateChargeState) -> DuplicateChargeState:
+        outcome = state.get("workflow_outcome", state["policy_decision"].outcome)
+        started = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_STARTED,
+            node_name=DRAFT_RESPONSE,
+            status="running",
+            public_payload={"summary": "Deterministic response drafting started."},
+        )
+        final_response = _deterministic_fallback_draft(state, outcome=outcome)
+        fallback = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.MODEL_FALLBACK,
+            node_name=DRAFT_RESPONSE,
+            status="completed",
+            public_payload={
+                "summary": "A deterministic evidence-cited response template was used.",
+                "fallback": "deterministic_template",
+            },
+        )
+        completed = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_COMPLETED,
+            node_name=DRAFT_RESPONSE,
+            status="completed",
+            public_payload={
+                "summary": "Customer response and internal note drafted.",
+                "citation_count": len(final_response.cited_evidence_ids),
+                "uncertainty_disclosed": final_response.uncertainty_disclosure is not None,
+            },
+        )
+        return {
+            "final_response": final_response,
+            "workflow_outcome": outcome,
+            "emitted_events": [started, fallback, completed],
+        }
+
+    return node
+
+
+def _deterministic_fallback_draft(
+    state: DuplicateChargeState,
+    *,
+    outcome: WorkflowOutcome,
+) -> FinalResponse:
+    decision = state["policy_decision"]
+    verification = state["evidence_verification"]
+    citations = verification.validated_evidence_ids
+    if not citations:
+        raise RuntimeError("cannot draft a final response without a validated evidence citation")
+    citation_text = ", ".join(f"[{evidence_id}]" for evidence_id in citations)
+    if outcome is WorkflowOutcome.NO_ACTION:
+        body = (
+            "We reviewed the available synthetic AtlasFlow billing records and found only one "
+            "successful payment for the billing period, so we did not make an account change. "
+            f"Evidence reviewed: {citation_text}."
+        )
+        internal_note = (
+            "Deterministic duplicate-charge validation did not confirm a duplicate payment. "
+            f"Reason code: {decision.reason_code}. Evidence: {citation_text}."
+        )
+        uncertainty = (
+            "This conclusion is limited to the synthetic records available during this review; "
+            "new or changed billing records should trigger another investigation."
+        )
+    elif outcome is WorkflowOutcome.ESCALATE:
+        missing = ", ".join(verification.missing_evidence_types) or "none identified"
+        body = (
+            "We could not verify the reported duplicate charge with enough synthetic evidence. "
+            "We have routed the case for specialist review and made no account change. "
+            f"Evidence available: {citation_text}."
+        )
+        internal_note = (
+            f"Escalated after deterministic review. Reason code: {decision.reason_code}. "
+            f"Missing evidence types: {missing}. Evidence: {citation_text}."
+        )
+        uncertainty = (
+            "The available synthetic records are incomplete or do not support a safe automated "
+            "conclusion; a specialist must verify the missing information."
+        )
+    else:  # pragma: no cover - graph routing excludes approval-required drafting
+        raise RuntimeError("approval-required outcomes cannot be drafted or finalized")
+    return FinalResponse(
+        subject="Update on your AtlasFlow billing investigation",
+        body=body,
+        internal_case_note=internal_note,
+        cited_evidence_ids=citations,
+        uncertainty_disclosure=uncertainty,
+    )
+
+
+def _finalize_node(
+    *,
+    persistence: WorkflowPersistence,
+    object_storage: ObjectStorage,
+    lease: ExecutionLease,
+    organization_id: UUID,
+) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+    def node(state: DuplicateChargeState) -> DuplicateChargeState:
+        outcome = state["workflow_outcome"]
+        if outcome is WorkflowOutcome.APPROVAL_REQUIRED:
+            raise RuntimeError("approval-required outcomes cannot be finalized")
+        started = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_STARTED,
+            node_name=FINALIZE_RUN,
+            status="running",
+            public_payload={"summary": "Run report finalization started."},
+        )
+        report = _structured_report(state)
+        json_content = (
+            json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+        ).encode()
+        markdown_content = _markdown_report(state).encode()
+        stored_objects = (
+            (
+                ArtifactKind.JSON_REPORT,
+                object_storage.put_object(
+                    object_key=f"runs/{lease.run_id}/report.json",
+                    content=json_content,
+                    mime_type="application/json",
+                ),
+            ),
+            (
+                ArtifactKind.MARKDOWN_BRIEF,
+                object_storage.put_object(
+                    object_key=f"runs/{lease.run_id}/report.md",
+                    content=markdown_content,
+                    mime_type="text/markdown; charset=utf-8",
+                ),
+            ),
+        )
+        artifacts = [
+            persistence.record_artifact(
+                lease=lease,
+                organization_id=organization_id,
+                kind=kind,
+                stored_object=stored,
+            )
+            for kind, stored in stored_objects
+        ]
+        completed = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_COMPLETED,
+            node_name=FINALIZE_RUN,
+            status="completed",
+            public_payload={
+                "summary": "Structured JSON and Markdown reports were finalized.",
+                "artifact_kinds": cast(JsonValue, [artifact.kind.value for artifact in artifacts]),
+            },
+        )
+        return {"finalized_artifacts": artifacts, "emitted_events": [started, completed]}
+
+    return node
+
+
+def _structured_report(state: DuplicateChargeState) -> dict[str, JsonValue]:
+    return {
+        "schema_version": "1.0",
+        "run_id": str(state["run_id"]),
+        "workflow_outcome": state["workflow_outcome"].value,
+        "reason_code": state["policy_decision"].reason_code,
+        "final_response": cast(JsonValue, state["final_response"].model_dump(mode="json")),
+        "evidence": cast(
+            JsonValue,
+            [
+                {
+                    "evidence_id": item.evidence_id,
+                    "source_system": item.source_system.value,
+                    "source_object_type": item.source_object_type,
+                    "source_object_id": item.source_object_id,
+                    "fact": item.fact,
+                    "integrity_hash": item.integrity_hash,
+                }
+                for item in state.get("evidence", [])
+            ],
+        ),
+        "evidence_verification": cast(
+            JsonValue, state["evidence_verification"].model_dump(mode="json")
+        ),
+    }
+
+
+def _markdown_report(state: DuplicateChargeState) -> str:
+    response = state["final_response"]
+    evidence_by_id = {item.evidence_id: item for item in state.get("evidence", [])}
+    citations = "\n".join(
+        f"- `{evidence_id}` — {evidence_by_id[evidence_id].fact}"
+        for evidence_id in response.cited_evidence_ids
+    )
+    return (
+        "# AtlasFlow billing investigation\n\n"
+        f"Outcome: `{state['workflow_outcome'].value}`  \n"
+        f"Reason code: `{state['policy_decision'].reason_code}`\n\n"
+        "## Customer response\n\n"
+        f"**{response.subject}**\n\n{response.body}\n\n"
+        "## Internal note\n\n"
+        f"{response.internal_case_note}\n\n"
+        "## Uncertainty disclosure\n\n"
+        f"{response.uncertainty_disclosure}\n\n"
+        "## Evidence citations\n\n"
+        f"{citations}\n"
+    )
 
 
 def _collect_evidence(
@@ -752,6 +1005,27 @@ def _integrity_hash(record: BaseModel) -> str:
         record.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=True
     )
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _case_report_evidence(state: DuplicateChargeState) -> EvidenceItem:
+    ticket = state["ticket"]
+    run_id = state["run_id"]
+    return EvidenceItem(
+        evidence_id=f"case_report:{run_id}",
+        source_system=SourceSystem.CASE_HISTORY,
+        source_object_type="support_case_report",
+        source_object_id=str(run_id),
+        observed_at=datetime.fromisoformat(state["case_created_at"]),
+        fact=(
+            "The synthetic support case reported a possible duplicate charge for "
+            f"customer reference {ticket.customer_reference}."
+        ),
+        structured_fields={
+            "customer_reference": ticket.customer_reference,
+            "reported_category": CaseCategory.DUPLICATE_CHARGE.value,
+        },
+        integrity_hash=_integrity_hash(ticket),
+    )
 
 
 def _customer_evidence(item: CustomerRecord, result: ToolResult[CustomerRecord]) -> EvidenceItem:
