@@ -41,6 +41,7 @@ make typecheck     # run TypeScript and mypy
 make test          # run the Python test suite
 make contracts-generate # regenerate OpenAPI and TypeScript contracts
 make contracts-check    # fail when generated contracts have drifted
+make generate-data  # regenerate deterministic v1 AtlasFlow fixtures
 ```
 
 ## Shared contracts
@@ -90,8 +91,9 @@ scripts/              Repository automation
 docs/                 Product, architecture, reliability, and security documentation
 ```
 
-Dataset generation, synthetic system routes, and workflow run creation/execution remain
-intentional scaffolding for their dedicated follow-up issues.
+Synthetic system routes and workflow run creation/execution remain intentional scaffolding for
+their dedicated follow-up issues. The dataset generator writes public fixtures separately from
+evaluation-only ground truth; generated files are reproducible and intentionally ignored by Git.
 
 ## First tracer-bullet goal
 

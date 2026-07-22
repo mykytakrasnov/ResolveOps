@@ -2,7 +2,7 @@ PYTHON_PROJECT := services/agent-api
 PYTHON_SRC := $(CURDIR)/$(PYTHON_PROJECT)/src
 LOCAL_DATABASE_URL := postgresql+psycopg://resolveops:resolveops@localhost:5432/resolveops
 
-.PHONY: bootstrap check contracts-check contracts-generate format format-check infra-down infra-up lint migrate migration-sql test typecheck
+.PHONY: bootstrap check contracts-check contracts-generate format format-check generate-data infra-down infra-up lint migrate migration-sql synthetic-data-generate test typecheck
 
 bootstrap:
 	pnpm install --frozen-lockfile
@@ -10,15 +10,15 @@ bootstrap:
 
 format:
 	pnpm format
-	uv run --directory $(PYTHON_PROJECT) ruff format src tests migrations
+	uv run --directory $(PYTHON_PROJECT) ruff format src tests migrations ../../scripts
 
 format-check:
 	pnpm format:check
-	uv run --directory $(PYTHON_PROJECT) ruff format --check src tests migrations
+	uv run --directory $(PYTHON_PROJECT) ruff format --check src tests migrations ../../scripts
 
 lint:
 	pnpm lint
-	uv run --directory $(PYTHON_PROJECT) ruff check src tests migrations
+	uv run --directory $(PYTHON_PROJECT) ruff check src tests migrations ../../scripts
 
 typecheck:
 	pnpm typecheck
@@ -32,6 +32,11 @@ contracts-generate:
 
 contracts-check:
 	PYTHONPATH=$(PYTHON_SRC) uv run --project $(PYTHON_PROJECT) python -m resolveops.models.contract_generation --check --repository-root $(CURDIR)
+
+generate-data:
+	uv run --project $(PYTHON_PROJECT) python scripts/generate_synthetic_data.py
+
+synthetic-data-generate: generate-data
 
 infra-up:
 	docker compose up -d postgres minio minio-init
