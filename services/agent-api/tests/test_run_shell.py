@@ -293,7 +293,7 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
         assert response.status_code == 200, response.text
         assert response.headers["content-type"].startswith("text/event-stream")
         event_ids = [line for line in response.text.splitlines() if line.startswith("id: ")]
-        assert event_ids == [f"id: {sequence}" for sequence in range(1, 26)]
+        assert event_ids == [f"id: {sequence}" for sequence in range(1, 36)]
 
         run_response = client.get(f"/api/v1/runs/{run_id}")
         assert run_response.status_code == 200
@@ -302,8 +302,8 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
 
         reconnect = client.get(f"/api/v1/runs/{run_id}/events?after_sequence=2")
         assert reconnect.status_code == 200
-        assert [event["sequence"] for event in reconnect.json()["events"]] == list(range(3, 26))
-        assert reconnect.json()["last_sequence"] == 25
+        assert [event["sequence"] for event in reconnect.json()["events"]] == list(range(3, 36))
+        assert reconnect.json()["last_sequence"] == 35
 
         replay = client.post(
             f"/api/v1/runs/{run_id}/execute",

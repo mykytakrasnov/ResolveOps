@@ -73,6 +73,65 @@ class EvidenceBundle(ContractModel):
         return self
 
 
+class EvidenceClaim(ContractModel):
+    """Untrusted factual claim tied to exact evidence returned by tools."""
+
+    fact: str = Field(min_length=1, max_length=2_000)
+    cited_evidence_ids: list[str] = Field(min_length=1)
+
+
+class EvidenceVerification(ContractModel):
+    """Deterministic, public-safe result of checking evidence and citations."""
+
+    verified: bool
+    completeness_score: float = Field(ge=0, le=1)
+    validated_evidence_ids: list[str] = Field(default_factory=list)
+    missing_evidence_types: list[str] = Field(default_factory=list)
+    hallucinated_evidence_ids: list[str] = Field(default_factory=list)
+    unsupported_claim_count: int = Field(default=0, ge=0)
+    contradictions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def verified_result_is_internally_consistent(self) -> "EvidenceVerification":
+        has_failure = bool(
+            self.completeness_score < 1
+            or self.missing_evidence_types
+            or self.hallucinated_evidence_ids
+            or self.unsupported_claim_count
+            or self.contradictions
+        )
+        if self.verified == has_failure:
+            raise ValueError("verified evidence result is inconsistent with its findings")
+        return self
+
+
+class DuplicateChargeValidation(ContractModel):
+    """Code-calculated duplicate-charge finding; no model arithmetic is accepted."""
+
+    confirmed: bool
+    reason_code: str = Field(min_length=1, max_length=100)
+    account_id: str | None = Field(default=None, max_length=160)
+    allowed_credit_cents: int | None = Field(default=None, gt=0)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+    invoice_evidence_ids: list[str] = Field(default_factory=list)
+    payment_evidence_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def confirmed_result_has_calculated_fields(self) -> "DuplicateChargeValidation":
+        calculated = (self.account_id, self.allowed_credit_cents, self.currency)
+        if self.confirmed and (
+            any(value is None for value in calculated)
+            or not self.invoice_evidence_ids
+            or len(self.payment_evidence_ids) < 2
+        ):
+            raise ValueError(
+                "confirmed duplicate charge requires calculated evidence-backed fields"
+            )
+        if not self.confirmed and any(value is not None for value in calculated):
+            raise ValueError("unconfirmed duplicate charge cannot contain calculated action fields")
+        return self
+
+
 class CaseCategory(StrEnum):
     DUPLICATE_CHARGE = "duplicate_charge"
     BILLING = "billing"
@@ -177,6 +236,47 @@ class RiskLevel(StrEnum):
     R2 = "R2"
     R3 = "R3"
     R4 = "R4"
+
+
+class WorkflowOutcome(StrEnum):
+    ESCALATE = "escalate"
+    NO_ACTION = "no_action"
+    APPROVAL_REQUIRED = "approval_required"
+
+
+class PolicyDecision(ContractModel):
+    """Sanitized deterministic policy result, never an executable proposal."""
+
+    outcome: WorkflowOutcome
+    risk_level: RiskLevel
+    reason_code: str = Field(min_length=1, max_length=100)
+    action_type: ActionType | None = None
+    target_reference: str | None = Field(default=None, max_length=160)
+    canonical_parameters: dict[str, JsonValue] = Field(default_factory=dict)
+    policy_key: str | None = Field(default=None, max_length=160)
+    policy_version: str | None = Field(default=None, max_length=80)
+    approval_required: bool = False
+
+    @model_validator(mode="after")
+    def action_fields_exist_only_for_approval(self) -> "PolicyDecision":
+        has_action_fields = bool(
+            self.action_type is not None
+            or self.target_reference is not None
+            or self.canonical_parameters
+        )
+        if self.outcome is WorkflowOutcome.APPROVAL_REQUIRED:
+            if (
+                not self.approval_required
+                or self.action_type is None
+                or self.target_reference is None
+                or not self.canonical_parameters
+                or self.policy_key is None
+                or self.policy_version is None
+            ):
+                raise ValueError("approval outcome requires a complete sanitized action")
+        elif self.approval_required or has_action_fields:
+            raise ValueError("non-approval outcome cannot contain executable action fields")
+        return self
 
 
 class ProposalStatus(StrEnum):
@@ -358,6 +458,8 @@ class WorkflowEventType(StrEnum):
     MODEL_RETRY = "model.retry"
     MODEL_FALLBACK = "model.fallback"
     EVIDENCE_ADDED = "evidence.added"
+    EVIDENCE_VERIFIED = "evidence.verified"
+    POLICY_EVALUATED = "policy.evaluated"
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_DECIDED = "approval.decided"
     ACTION_EXECUTED = "action.executed"

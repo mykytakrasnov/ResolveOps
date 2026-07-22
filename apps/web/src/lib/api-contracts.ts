@@ -52,6 +52,8 @@ export const workflowEventTypeSchema = z.enum([
   "model.retry",
   "model.fallback",
   "evidence.added",
+  "evidence.verified",
+  "policy.evaluated",
   "approval.requested",
   "approval.decided",
   "action.executed",

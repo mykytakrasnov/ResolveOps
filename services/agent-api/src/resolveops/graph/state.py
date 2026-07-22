@@ -8,10 +8,14 @@ from uuid import UUID
 
 from resolveops.models.contracts import (
     CaseClassification,
+    DuplicateChargeValidation,
     EvidenceItem,
+    EvidenceVerification,
     InvestigationPlan,
+    PolicyDecision,
     TicketInput,
     WorkflowEvent,
+    WorkflowOutcome,
 )
 
 
@@ -26,4 +30,8 @@ class DuplicateChargeState(TypedDict, total=False):
     invoice_ids: list[str]
     evidence: Annotated[list[EvidenceItem], add]
     tool_errors: Annotated[list[str], add]
+    evidence_verification: EvidenceVerification
+    duplicate_charge_validation: DuplicateChargeValidation
+    policy_decision: PolicyDecision
+    workflow_outcome: WorkflowOutcome
     emitted_events: Annotated[list[WorkflowEvent], add]

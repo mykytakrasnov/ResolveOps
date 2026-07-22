@@ -22,6 +22,8 @@ export type ActionType = "create_internal_case_note" | "apply_account_credit" | 
 
 export type RiskLevel = "R0" | "R1" | "R2" | "R3" | "R4";
 
+export type WorkflowOutcome = "escalate" | "no_action" | "approval_required";
+
 export type ProposalStatus = "pending_approval" | "approved" | "rejected" | "blocked" | "executed" | "invalidated";
 
 export type ApprovalDecisionType = "approve" | "reject";
@@ -32,7 +34,7 @@ export type RunStatus = "created" | "running" | "waiting_for_approval" | "comple
 
 export type CaseStatus = "open" | "investigating" | "waiting_for_approval" | "resolved" | "escalated";
 
-export type WorkflowEventType = "run.started" | "node.started" | "node.completed" | "tool.started" | "tool.completed" | "tool.failed" | "model.retry" | "model.fallback" | "evidence.added" | "approval.requested" | "approval.decided" | "action.executed" | "run.escalated" | "run.completed" | "run.failed";
+export type WorkflowEventType = "run.started" | "node.started" | "node.completed" | "tool.started" | "tool.completed" | "tool.failed" | "model.retry" | "model.fallback" | "evidence.added" | "evidence.verified" | "policy.evaluated" | "approval.requested" | "approval.decided" | "action.executed" | "run.escalated" | "run.completed" | "run.failed";
 
 export type ArtifactKind = "json_report" | "markdown_brief" | "customer_response" | "public_events";
 
@@ -92,6 +94,31 @@ export interface EvidenceBundle {
   contradictions?: Array<string>;
 }
 
+export interface EvidenceClaim {
+  fact: string;
+  cited_evidence_ids: Array<string>;
+}
+
+export interface EvidenceVerification {
+  verified: boolean;
+  completeness_score: number;
+  validated_evidence_ids?: Array<string>;
+  missing_evidence_types?: Array<string>;
+  hallucinated_evidence_ids?: Array<string>;
+  unsupported_claim_count?: number;
+  contradictions?: Array<string>;
+}
+
+export interface DuplicateChargeValidation {
+  confirmed: boolean;
+  reason_code: string;
+  account_id?: string | null;
+  allowed_credit_cents?: number | null;
+  currency?: string | null;
+  invoice_evidence_ids?: Array<string>;
+  payment_evidence_ids?: Array<string>;
+}
+
 export interface ActionProposalInput {
   action_type: ActionType;
   target_reference: string;
@@ -108,6 +135,18 @@ export interface ResolutionProposal {
   action_proposal?: ActionProposalInput | null;
   uncertain?: boolean;
   missing_data?: Array<string>;
+}
+
+export interface PolicyDecision {
+  outcome: WorkflowOutcome;
+  risk_level: RiskLevel;
+  reason_code: string;
+  action_type?: ActionType | null;
+  target_reference?: string | null;
+  canonical_parameters?: Record<string, JsonValue>;
+  policy_key?: string | null;
+  policy_version?: string | null;
+  approval_required?: boolean;
 }
 
 export interface ActionProposal {

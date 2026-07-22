@@ -16,7 +16,13 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
 from resolveops.graph.duplicate_charge import execute_duplicate_charge_graph
-from resolveops.models.contracts import RunStatus, WorkflowEvent, WorkflowEventType, WorkflowRun
+from resolveops.models.contracts import (
+    RunStatus,
+    WorkflowEvent,
+    WorkflowEventType,
+    WorkflowOutcome,
+    WorkflowRun,
+)
 from resolveops.models.run_api import CreateRunRequest, CreateRunResponse, WorkflowEventPage
 from resolveops.repositories.runs import (
     CaseNotFoundError,
@@ -234,6 +240,8 @@ def _execute_shell(
     lease: ExecutionLease,
     read_tools: ReadOnlyToolset | None = None,
 ) -> Iterator[WorkflowEvent]:
+    workflow_outcome: WorkflowOutcome | None = None
+    outcome_reason_code: str | None = None
     yield repository.append_event(
         lease=lease,
         organization_id=principal.organization_id,
@@ -265,7 +273,7 @@ def _execute_shell(
             actor_user_id=principal.user_id,
             allow_all=principal.can_access_all_runs,
         )
-        yield from execute_duplicate_charge_graph(
+        graph_events = execute_duplicate_charge_graph(
             tools=read_tools,
             persistence=repository,
             lease=lease,
@@ -273,12 +281,34 @@ def _execute_shell(
             ticket=run_case.ticket,
             case_created_at=run_case.created_at,
         )
+        while True:
+            try:
+                yield next(graph_events)
+            except StopIteration as completed:
+                workflow_outcome, outcome_reason_code = completed.value
+                break
+    if workflow_outcome is WorkflowOutcome.ESCALATE:
+        yield repository.append_event(
+            lease=lease,
+            organization_id=principal.organization_id,
+            event_type=WorkflowEventType.RUN_ESCALATED,
+            status="escalated",
+            public_payload={
+                "summary": "Investigation escalated after deterministic review.",
+                "reason_code": outcome_reason_code or "policy_escalation",
+            },
+            final_status=RunStatus.ESCALATED,
+        )
+        return
     yield repository.append_event(
         lease=lease,
         organization_id=principal.organization_id,
         event_type=WorkflowEventType.RUN_COMPLETED,
         status="completed",
-        public_payload={"report_status": "not_generated"},
+        public_payload={
+            "report_status": "not_generated",
+            "workflow_outcome": workflow_outcome.value if workflow_outcome else "shell_only",
+        },
         final_status=RunStatus.COMPLETED,
     )
 

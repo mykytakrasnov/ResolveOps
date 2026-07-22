@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from datetime import datetime, timedelta
 from typing import Any, Protocol, cast
 from uuid import UUID
@@ -17,8 +17,10 @@ from resolveops.graph.state import DuplicateChargeState
 from resolveops.models.contracts import (
     CaseCategory,
     CaseClassification,
+    EvidenceClaim,
     EvidenceItem,
     InvestigationPlan,
+    PolicyDecision,
     ReadToolName,
     RiskIndicator,
     SourceSystem,
@@ -27,6 +29,12 @@ from resolveops.models.contracts import (
     Urgency,
     WorkflowEvent,
     WorkflowEventType,
+    WorkflowOutcome,
+)
+from resolveops.policies.duplicate_charge import (
+    enforce_duplicate_charge_policy,
+    validate_duplicate_charge,
+    verify_evidence,
 )
 from resolveops.repositories.runs import ExecutionLease
 from resolveops.tools.contracts import (
@@ -49,6 +57,12 @@ NORMALIZE_INPUT = "normalize_input"
 CLASSIFY_CASE = "classify_case"
 SELECT_INVESTIGATION_RECIPE = "select_investigation_recipe"
 COLLECT_INITIAL_EVIDENCE = "collect_initial_evidence"
+VERIFY_EVIDENCE = "verify_evidence"
+VALIDATE_DUPLICATE_CHARGE = "validate_duplicate_charge"
+ENFORCE_POLICY = "enforce_policy"
+ESCALATE_CASE = "escalate_case"
+DRAFT_NO_ACTION = "draft_no_action"
+REQUEST_APPROVAL = "request_approval"
 DUPLICATE_CHARGE_RECIPE = "duplicate_charge_v1"
 BILLING_POLICY_KEY = "billing_duplicate_credit"
 BILLING_POLICY_VERSION = "3.0"
@@ -190,7 +204,7 @@ def build_duplicate_charge_graph(
     lease: ExecutionLease,
     organization_id: UUID,
 ) -> CompiledStateGraph[DuplicateChargeState, None, Any, Any]:
-    """Build the explicit four-node graph for the curated duplicate-charge recipe."""
+    """Build the bounded duplicate-charge investigation and policy graph."""
 
     graph = StateGraph(DuplicateChargeState)
     graph.add_node(
@@ -244,11 +258,78 @@ def build_duplicate_charge_graph(
             ),
         ),
     )
+    graph.add_node(
+        VERIFY_EVIDENCE,
+        cast(
+            Any,
+            _verification_node(
+                persistence=persistence,
+                lease=lease,
+                organization_id=organization_id,
+            ),
+        ),
+    )
+    graph.add_node(
+        VALIDATE_DUPLICATE_CHARGE,
+        cast(
+            Any,
+            _with_node_events(
+                VALIDATE_DUPLICATE_CHARGE,
+                persistence,
+                lease,
+                organization_id,
+                _validate_duplicate_charge_evidence,
+            ),
+        ),
+    )
+    graph.add_node(
+        ENFORCE_POLICY,
+        cast(
+            Any,
+            _policy_node(
+                persistence=persistence,
+                lease=lease,
+                organization_id=organization_id,
+            ),
+        ),
+    )
+    for node_name, operation in (
+        (ESCALATE_CASE, _escalate_case),
+        (DRAFT_NO_ACTION, _draft_no_action),
+        (REQUEST_APPROVAL, _request_approval),
+    ):
+        graph.add_node(
+            node_name,
+            cast(
+                Any,
+                _with_node_events(
+                    node_name,
+                    persistence,
+                    lease,
+                    organization_id,
+                    operation,
+                ),
+            ),
+        )
     graph.add_edge(START, NORMALIZE_INPUT)
     graph.add_edge(NORMALIZE_INPUT, CLASSIFY_CASE)
     graph.add_edge(CLASSIFY_CASE, SELECT_INVESTIGATION_RECIPE)
     graph.add_edge(SELECT_INVESTIGATION_RECIPE, COLLECT_INITIAL_EVIDENCE)
-    graph.add_edge(COLLECT_INITIAL_EVIDENCE, END)
+    graph.add_edge(COLLECT_INITIAL_EVIDENCE, VERIFY_EVIDENCE)
+    graph.add_edge(VERIFY_EVIDENCE, VALIDATE_DUPLICATE_CHARGE)
+    graph.add_edge(VALIDATE_DUPLICATE_CHARGE, ENFORCE_POLICY)
+    graph.add_conditional_edges(
+        ENFORCE_POLICY,
+        _route_policy_outcome,
+        {
+            WorkflowOutcome.ESCALATE.value: ESCALATE_CASE,
+            WorkflowOutcome.NO_ACTION.value: DRAFT_NO_ACTION,
+            WorkflowOutcome.APPROVAL_REQUIRED.value: REQUEST_APPROVAL,
+        },
+    )
+    graph.add_edge(ESCALATE_CASE, END)
+    graph.add_edge(DRAFT_NO_ACTION, END)
+    graph.add_edge(REQUEST_APPROVAL, END)
     return graph.compile()
 
 
@@ -260,7 +341,7 @@ def execute_duplicate_charge_graph(
     organization_id: UUID,
     ticket: TicketInput,
     case_created_at: datetime,
-) -> Iterator[WorkflowEvent]:
+) -> Generator[WorkflowEvent, None, tuple[WorkflowOutcome, str]]:
     graph = build_duplicate_charge_graph(
         tools=tools,
         persistence=persistence,
@@ -276,13 +357,24 @@ def execute_duplicate_charge_graph(
         "tool_errors": [],
         "emitted_events": [],
     }
+    workflow_outcome: WorkflowOutcome | None = None
+    outcome_reason_code: str | None = None
     for update in graph.stream(initial, stream_mode="updates"):
         for node_update in update.values():
             if not isinstance(node_update, dict):
                 continue
+            raw_outcome = node_update.get("workflow_outcome")
+            if isinstance(raw_outcome, WorkflowOutcome):
+                workflow_outcome = raw_outcome
+            policy_decision = node_update.get("policy_decision")
+            if isinstance(policy_decision, PolicyDecision):
+                outcome_reason_code = policy_decision.reason_code
             for event in node_update.get("emitted_events", []):
                 if isinstance(event, WorkflowEvent):
                     yield event
+    if workflow_outcome is None or outcome_reason_code is None:
+        raise RuntimeError("duplicate-charge graph completed without a policy outcome")
+    return workflow_outcome, outcome_reason_code
 
 
 def _with_node_events(
@@ -428,6 +520,143 @@ def _collect_node(
         }
 
     return node
+
+
+def _verification_node(
+    *,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+    def node(state: DuplicateChargeState) -> DuplicateChargeState:
+        started = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_STARTED,
+            node_name=VERIFY_EVIDENCE,
+            status="running",
+            public_payload={"summary": "Evidence verification started."},
+        )
+        evidence = state.get("evidence", [])
+        result = verify_evidence(
+            evidence=evidence,
+            cited_evidence_ids=[item.evidence_id for item in evidence],
+            claims=[
+                EvidenceClaim(fact=item.fact, cited_evidence_ids=[item.evidence_id])
+                for item in evidence
+            ],
+        )
+        verified = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.EVIDENCE_VERIFIED,
+            node_name=VERIFY_EVIDENCE,
+            status="verified" if result.verified else "rejected",
+            public_payload={
+                "summary": "Evidence passed deterministic verification."
+                if result.verified
+                else "Evidence requires escalation after deterministic verification.",
+                "verified": result.verified,
+                "completeness_score": result.completeness_score,
+                "missing_evidence_types": cast(JsonValue, result.missing_evidence_types),
+                "hallucinated_evidence_id_count": len(result.hallucinated_evidence_ids),
+                "unsupported_claim_count": result.unsupported_claim_count,
+                "contradiction_count": len(result.contradictions),
+            },
+        )
+        completed = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_COMPLETED,
+            node_name=VERIFY_EVIDENCE,
+            status="completed" if result.verified else "completed_with_errors",
+            public_payload={"summary": "Evidence verification completed."},
+        )
+        return {"evidence_verification": result, "emitted_events": [started, verified, completed]}
+
+    return node
+
+
+def _validate_duplicate_charge_evidence(state: DuplicateChargeState) -> DuplicateChargeState:
+    return {"duplicate_charge_validation": validate_duplicate_charge(state.get("evidence", []))}
+
+
+def _policy_node(
+    *,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+    def node(state: DuplicateChargeState) -> DuplicateChargeState:
+        started = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_STARTED,
+            node_name=ENFORCE_POLICY,
+            status="running",
+            public_payload={"summary": "Billing-credit policy evaluation started."},
+        )
+        decision = enforce_duplicate_charge_policy(
+            evidence=state.get("evidence", []),
+            verification=state["evidence_verification"],
+            validation=state["duplicate_charge_validation"],
+        )
+        evaluated = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.POLICY_EVALUATED,
+            node_name=ENFORCE_POLICY,
+            status="completed",
+            public_payload=_public_policy_summary(decision),
+        )
+        completed = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_COMPLETED,
+            node_name=ENFORCE_POLICY,
+            status="completed",
+            public_payload={"summary": "Billing-credit policy evaluation completed."},
+        )
+        return {"policy_decision": decision, "emitted_events": [started, evaluated, completed]}
+
+    return node
+
+
+def _public_policy_summary(decision: PolicyDecision) -> dict[str, JsonValue]:
+    amount = decision.canonical_parameters.get("amount_cents")
+    payload: dict[str, JsonValue] = {
+        "summary": "Deterministic billing-credit policy evaluated.",
+        "outcome": decision.outcome.value,
+        "risk_level": decision.risk_level.value,
+        "reason_code": decision.reason_code,
+        "approval_required": decision.approval_required,
+    }
+    if isinstance(amount, int):
+        payload["allowed_credit_cents"] = amount
+    if decision.policy_key is not None:
+        payload["policy_key"] = decision.policy_key
+    if decision.policy_version is not None:
+        payload["policy_version"] = decision.policy_version
+    return payload
+
+
+def _route_policy_outcome(state: DuplicateChargeState) -> str:
+    return state["policy_decision"].outcome.value
+
+
+def _escalate_case(state: DuplicateChargeState) -> DuplicateChargeState:
+    del state
+    return {"workflow_outcome": WorkflowOutcome.ESCALATE}
+
+
+def _draft_no_action(state: DuplicateChargeState) -> DuplicateChargeState:
+    del state
+    return {"workflow_outcome": WorkflowOutcome.NO_ACTION}
+
+
+def _request_approval(state: DuplicateChargeState) -> DuplicateChargeState:
+    del state
+    return {"workflow_outcome": WorkflowOutcome.APPROVAL_REQUIRED}
 
 
 def _collect_evidence(

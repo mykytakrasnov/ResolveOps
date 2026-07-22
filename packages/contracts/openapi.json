@@ -419,6 +419,81 @@
         "title": "CaseStatus",
         "type": "string"
       },
+      "DuplicateChargeValidation": {
+        "additionalProperties": false,
+        "description": "Code-calculated duplicate-charge finding; no model arithmetic is accepted.",
+        "properties": {
+          "account_id": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Account Id"
+          },
+          "allowed_credit_cents": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Allowed Credit Cents"
+          },
+          "confirmed": {
+            "title": "Confirmed",
+            "type": "boolean"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "pattern": "^[A-Z]{3}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Currency"
+          },
+          "invoice_evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Invoice Evidence Ids",
+            "type": "array"
+          },
+          "payment_evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Payment Evidence Ids",
+            "type": "array"
+          },
+          "reason_code": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Reason Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "confirmed",
+          "reason_code"
+        ],
+        "title": "DuplicateChargeValidation",
+        "type": "object"
+      },
       "EvidenceBundle": {
         "additionalProperties": false,
         "description": "Verified evidence and deterministic completeness metadata.",
@@ -449,6 +524,32 @@
           "completeness_score"
         ],
         "title": "EvidenceBundle",
+        "type": "object"
+      },
+      "EvidenceClaim": {
+        "additionalProperties": false,
+        "description": "Untrusted factual claim tied to exact evidence returned by tools.",
+        "properties": {
+          "cited_evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Cited Evidence Ids",
+            "type": "array"
+          },
+          "fact": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Fact",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fact",
+          "cited_evidence_ids"
+        ],
+        "title": "EvidenceClaim",
         "type": "object"
       },
       "EvidenceItem": {
@@ -517,6 +618,62 @@
           "fact"
         ],
         "title": "EvidenceItem",
+        "type": "object"
+      },
+      "EvidenceVerification": {
+        "additionalProperties": false,
+        "description": "Deterministic, public-safe result of checking evidence and citations.",
+        "properties": {
+          "completeness_score": {
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Completeness Score",
+            "type": "number"
+          },
+          "contradictions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Contradictions",
+            "type": "array"
+          },
+          "hallucinated_evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Hallucinated Evidence Ids",
+            "type": "array"
+          },
+          "missing_evidence_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing Evidence Types",
+            "type": "array"
+          },
+          "unsupported_claim_count": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Unsupported Claim Count",
+            "type": "integer"
+          },
+          "validated_evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Validated Evidence Ids",
+            "type": "array"
+          },
+          "verified": {
+            "title": "Verified",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "verified",
+          "completeness_score"
+        ],
+        "title": "EvidenceVerification",
         "type": "object"
       },
       "FinalResponse": {
@@ -617,6 +774,93 @@
         "type": "object"
       },
       "JsonValue": {},
+      "PolicyDecision": {
+        "additionalProperties": false,
+        "description": "Sanitized deterministic policy result, never an executable proposal.",
+        "properties": {
+          "action_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ActionType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "approval_required": {
+            "default": false,
+            "title": "Approval Required",
+            "type": "boolean"
+          },
+          "canonical_parameters": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Canonical Parameters",
+            "type": "object"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/WorkflowOutcome"
+          },
+          "policy_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Policy Key"
+          },
+          "policy_version": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Policy Version"
+          },
+          "reason_code": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Reason Code",
+            "type": "string"
+          },
+          "risk_level": {
+            "$ref": "#/components/schemas/RiskLevel"
+          },
+          "target_reference": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Target Reference"
+          }
+        },
+        "required": [
+          "outcome",
+          "risk_level",
+          "reason_code"
+        ],
+        "title": "PolicyDecision",
+        "type": "object"
+      },
       "ProposalStatus": {
         "enum": [
           "pending_approval",
@@ -1185,6 +1429,8 @@
           "model.retry",
           "model.fallback",
           "evidence.added",
+          "evidence.verified",
+          "policy.evaluated",
           "approval.requested",
           "approval.decided",
           "action.executed",
@@ -1193,6 +1439,15 @@
           "run.failed"
         ],
         "title": "WorkflowEventType",
+        "type": "string"
+      },
+      "WorkflowOutcome": {
+        "enum": [
+          "escalate",
+          "no_action",
+          "approval_required"
+        ],
+        "title": "WorkflowOutcome",
         "type": "string"
       },
       "WorkflowRun": {

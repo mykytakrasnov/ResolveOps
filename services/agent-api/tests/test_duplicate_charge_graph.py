@@ -12,18 +12,28 @@ from resolveops.api.runs import Principal, _execute_shell
 from resolveops.graph.duplicate_charge import (
     CLASSIFY_CASE,
     COLLECT_INITIAL_EVIDENCE,
+    ENFORCE_POLICY,
     NORMALIZE_INPUT,
     SELECT_INVESTIGATION_RECIPE,
+    VALIDATE_DUPLICATE_CHARGE,
+    VERIFY_EVIDENCE,
     build_duplicate_charge_graph,
 )
 from resolveops.graph.state import DuplicateChargeState
 from resolveops.models.contracts import (
     ReadToolName,
+    RiskLevel,
     RunStatus,
     TicketInput,
     ToolResult,
     WorkflowEvent,
     WorkflowEventType,
+    WorkflowOutcome,
+)
+from resolveops.policies.duplicate_charge import (
+    enforce_duplicate_charge_policy,
+    validate_duplicate_charge,
+    verify_evidence,
 )
 from resolveops.repositories.runs import DatabaseRunRepository, ExecutionLease, RunCase
 from resolveops.tools.contracts import (
@@ -136,6 +146,69 @@ class FakeBackend:
         )
 
 
+class MissingPolicyBackend(FakeBackend):
+    def get_policy(self, request: GetPolicyInput) -> PolicyRecord:
+        self.calls.append(ReadToolName.GET_POLICY)
+        raise ValueError(f"missing synthetic policy {request.policy_key}")
+
+
+class OnePaymentBackend(FakeBackend):
+    def get_payment_attempts(self, request: GetPaymentAttemptsInput) -> PaymentAttemptPage:
+        self.calls.append(ReadToolName.GET_PAYMENT_ATTEMPTS)
+        return PaymentAttemptPage(
+            items=[
+                PaymentAttemptRecord(
+                    payment_attempt_id=PAYMENT_ONE_ID,
+                    account_id=request.account_id,
+                    invoice_id=request.invoice_id,
+                    amount_cents=4_900,
+                    currency="USD",
+                    status="succeeded",
+                    processor_reference="synthetic_1",
+                    attempted_at=NOW - timedelta(hours=1),
+                )
+            ]
+        )
+
+
+class AboveLimitBackend(FakeBackend):
+    def list_invoices(self, request: ListInvoicesInput) -> InvoicePage:
+        self.calls.append(ReadToolName.LIST_INVOICES)
+        return InvoicePage(
+            items=[
+                InvoiceRecord(
+                    invoice_id=INVOICE_ID,
+                    account_id=request.account_id,
+                    subscription_id=SUBSCRIPTION_ID,
+                    period_start=date(2026, 7, 1),
+                    period_end=date(2026, 8, 1),
+                    amount_cents=15_000,
+                    currency="USD",
+                    status="paid",
+                    issued_at=NOW - timedelta(days=1),
+                )
+            ]
+        )
+
+    def get_payment_attempts(self, request: GetPaymentAttemptsInput) -> PaymentAttemptPage:
+        self.calls.append(ReadToolName.GET_PAYMENT_ATTEMPTS)
+        return PaymentAttemptPage(
+            items=[
+                PaymentAttemptRecord(
+                    payment_attempt_id=payment_id,
+                    account_id=request.account_id,
+                    invoice_id=request.invoice_id,
+                    amount_cents=15_000,
+                    currency="USD",
+                    status="succeeded",
+                    processor_reference=f"synthetic_{index}",
+                    attempted_at=NOW - timedelta(hours=index),
+                )
+                for index, payment_id in enumerate((PAYMENT_ONE_ID, PAYMENT_TWO_ID), start=1)
+            ]
+        )
+
+
 class FakePersistence:
     def __init__(self) -> None:
         self.events: list[WorkflowEvent] = []
@@ -223,6 +296,36 @@ class FakePersistence:
         )
 
 
+def invoke_graph(backend: FakeBackend) -> tuple[DuplicateChargeState, FakePersistence]:
+    persistence = FakePersistence()
+    lease = ExecutionLease(
+        run_id=RUN_ID,
+        token=UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        attempt=1,
+        expires_at=NOW + timedelta(minutes=1),
+    )
+    graph = build_duplicate_charge_graph(
+        tools=ReadOnlyToolset(backend, now=lambda: NOW),
+        persistence=persistence,
+        lease=lease,
+        organization_id=ORGANIZATION_ID,
+    )
+    initial: DuplicateChargeState = {
+        "run_id": RUN_ID,
+        "organization_id": ORGANIZATION_ID,
+        "ticket": TicketInput(
+            subject="Charged twice after plan upgrade",
+            body="We upgraded yesterday and see two completed charges for the same period.",
+            customer_reference="org_atlas_001",
+        ),
+        "case_created_at": NOW.isoformat(),
+        "evidence": [],
+        "tool_errors": [],
+        "emitted_events": [],
+    }
+    return cast(DuplicateChargeState, graph.invoke(initial)), persistence
+
+
 def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_events() -> None:
     backend = FakeBackend()
     persistence = FakePersistence()
@@ -244,6 +347,9 @@ def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_even
         CLASSIFY_CASE,
         SELECT_INVESTIGATION_RECIPE,
         COLLECT_INITIAL_EVIDENCE,
+        VERIFY_EVIDENCE,
+        VALIDATE_DUPLICATE_CHARGE,
+        ENFORCE_POLICY,
     }.issubset(graph.nodes)
 
     initial: DuplicateChargeState = {
@@ -275,6 +381,16 @@ def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_even
         "policy:billing_duplicate_credit:v3.0",
     }
     assert all(item.integrity_hash is not None for item in result["evidence"])
+    assert result["evidence_verification"].verified is True
+    assert result["duplicate_charge_validation"].confirmed is True
+    assert result["duplicate_charge_validation"].allowed_credit_cents == 4_900
+    assert result["policy_decision"].outcome is WorkflowOutcome.APPROVAL_REQUIRED
+    assert result["policy_decision"].risk_level is RiskLevel.R2
+    assert result["policy_decision"].canonical_parameters == {
+        "account_id": str(ACCOUNT_ID),
+        "amount_cents": 4_900,
+        "currency": "USD",
+    }
     assert all(attempt["status"] == "completed" for attempt in persistence.attempts)
     assert all(
         str(attempt["tool_call_id"]).startswith("execution-1:") for attempt in persistence.attempts
@@ -286,6 +402,12 @@ def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_even
     assert event_types.count(WorkflowEventType.TOOL_STARTED) == 5
     assert event_types.count(WorkflowEventType.TOOL_COMPLETED) == 5
     assert event_types.count(WorkflowEventType.EVIDENCE_ADDED) == 6
+    assert event_types.count(WorkflowEventType.EVIDENCE_VERIFIED) == 1
+    assert event_types.count(WorkflowEventType.POLICY_EVALUATED) == 1
+    public_payloads = [event.public_payload for event in persistence.events]
+    assert all("body" not in payload for payload in public_payloads)
+    assert all("rationale" not in payload for payload in public_payloads)
+    assert all("parameters" not in payload for payload in public_payloads)
     assert (
         event_types.index(WorkflowEventType.TOOL_STARTED)
         < event_types.index(WorkflowEventType.TOOL_COMPLETED)
@@ -325,3 +447,203 @@ def test_run_shell_publishes_only_events_already_recorded_by_graph_persistence()
         SELECT_INVESTIGATION_RECIPE,
         COLLECT_INITIAL_EVIDENCE,
     }
+
+
+def test_missing_policy_evidence_routes_to_escalation() -> None:
+    result, persistence = invoke_graph(MissingPolicyBackend())
+
+    assert result["evidence_verification"].verified is False
+    assert result["evidence_verification"].missing_evidence_types == ["policy"]
+    assert result["policy_decision"].outcome is WorkflowOutcome.ESCALATE
+    assert result["policy_decision"].risk_level is RiskLevel.R1
+    assert result["policy_decision"].canonical_parameters == {}
+    assert result["workflow_outcome"] is WorkflowOutcome.ESCALATE
+    verified_event = next(
+        event
+        for event in persistence.events
+        if event.event_type is WorkflowEventType.EVIDENCE_VERIFIED
+    )
+    assert verified_event.public_payload["verified"] is False
+
+
+def test_complete_non_duplicate_evidence_routes_to_no_action() -> None:
+    result, _ = invoke_graph(OnePaymentBackend())
+
+    assert result["evidence_verification"].verified is True
+    assert result["duplicate_charge_validation"].confirmed is False
+    assert result["policy_decision"].outcome is WorkflowOutcome.NO_ACTION
+    assert result["workflow_outcome"] is WorkflowOutcome.NO_ACTION
+
+
+def test_hallucinated_evidence_id_and_unsupported_fact_are_rejected() -> None:
+    result, _ = invoke_graph(FakeBackend())
+    evidence = result["evidence"]
+
+    verification = verify_evidence(
+        evidence=evidence,
+        cited_evidence_ids=[evidence[0].evidence_id, "invoice:hallucinated"],
+        claims=[
+            {
+                "fact": "A cash refund has already been issued.",
+                "cited_evidence_ids": [evidence[0].evidence_id],
+            }
+        ],
+    )
+
+    assert verification.verified is False
+    assert verification.hallucinated_evidence_ids == ["invoice:hallucinated"]
+    assert verification.unsupported_claim_count == 1
+
+
+def test_above_limit_credit_is_blocked_and_escalated() -> None:
+    result, _ = invoke_graph(AboveLimitBackend())
+
+    assert result["duplicate_charge_validation"].allowed_credit_cents == 15_000
+    assert result["policy_decision"].outcome is WorkflowOutcome.ESCALATE
+    assert result["policy_decision"].risk_level is RiskLevel.R3
+    assert result["policy_decision"].reason_code == "credit_above_limit"
+    assert result["policy_decision"].canonical_parameters == {}
+
+
+def test_forbidden_action_proposal_is_schema_validated_and_parameters_are_removed() -> None:
+    result, _ = invoke_graph(FakeBackend())
+    forbidden_proposal: object = {
+        "resolution_code": "duplicate_charge_confirmed",
+        "explanation": "The evidence supports one duplicate payment.",
+        "cited_evidence_ids": result["evidence_verification"].validated_evidence_ids,
+        "recommended_next_step": "Close the case without reviewer approval.",
+        "action_proposal": {
+            "action_type": "change_case_status",
+            "target_reference": str(ACCOUNT_ID),
+            "parameters": {
+                "status": "resolved",
+                "amount_cents": 999_999,
+                "arbitrary_url": "https://example.com/unsafe",
+            },
+            "rationale": "Bypass the billing-credit control.",
+            "cited_evidence_ids": result["evidence_verification"].validated_evidence_ids,
+        },
+    }
+
+    decision = enforce_duplicate_charge_policy(
+        evidence=result["evidence"],
+        verification=result["evidence_verification"],
+        validation=result["duplicate_charge_validation"],
+        untrusted_proposal=forbidden_proposal,
+    )
+
+    assert decision.outcome is WorkflowOutcome.ESCALATE
+    assert decision.reason_code == "forbidden_action"
+    assert decision.canonical_parameters == {}
+
+
+def test_allowed_action_uses_code_calculated_parameters_only() -> None:
+    result, _ = invoke_graph(FakeBackend())
+    untrusted_proposal: object = {
+        "resolution_code": "duplicate_charge_confirmed",
+        "explanation": "The evidence supports one duplicate payment.",
+        "cited_evidence_ids": result["evidence_verification"].validated_evidence_ids,
+        "recommended_next_step": "Apply an account credit after review.",
+        "action_proposal": {
+            "action_type": "apply_account_credit",
+            "target_reference": str(ACCOUNT_ID),
+            "parameters": {
+                "amount_cents": 999_999,
+                "currency": "BTC",
+                "arbitrary_url": "https://example.com/unsafe",
+            },
+            "rationale": "Credit the duplicate charge.",
+            "cited_evidence_ids": result["evidence_verification"].validated_evidence_ids,
+        },
+    }
+
+    decision = enforce_duplicate_charge_policy(
+        evidence=result["evidence"],
+        verification=result["evidence_verification"],
+        validation=result["duplicate_charge_validation"],
+        untrusted_proposal=untrusted_proposal,
+    )
+
+    assert decision.outcome is WorkflowOutcome.APPROVAL_REQUIRED
+    assert decision.canonical_parameters == {
+        "account_id": str(ACCOUNT_ID),
+        "amount_cents": 4_900,
+        "currency": "USD",
+    }
+
+
+def test_policy_rejects_a_proposal_with_a_hallucinated_citation() -> None:
+    result, _ = invoke_graph(FakeBackend())
+    untrusted_proposal: object = {
+        "resolution_code": "duplicate_charge_confirmed",
+        "explanation": "The evidence supports one duplicate payment.",
+        "cited_evidence_ids": ["payment_attempt:hallucinated"],
+        "recommended_next_step": "Apply an account credit after review.",
+        "action_proposal": {
+            "action_type": "apply_account_credit",
+            "target_reference": str(ACCOUNT_ID),
+            "parameters": {"amount_cents": 4_900},
+            "rationale": "Credit the duplicate charge.",
+            "cited_evidence_ids": result["duplicate_charge_validation"].payment_evidence_ids,
+        },
+    }
+
+    decision = enforce_duplicate_charge_policy(
+        evidence=result["evidence"],
+        verification=result["evidence_verification"],
+        validation=result["duplicate_charge_validation"],
+        untrusted_proposal=untrusted_proposal,
+    )
+
+    assert decision.outcome is WorkflowOutcome.ESCALATE
+    assert decision.reason_code == "unsupported_evidence_citation"
+    assert decision.canonical_parameters == {}
+
+
+def test_contradictory_payment_evidence_is_flagged() -> None:
+    result, _ = invoke_graph(FakeBackend())
+    evidence = list(result["evidence"])
+    payment_index = next(
+        index for index, item in enumerate(evidence) if item.source_object_type == "payment_attempt"
+    )
+    payment = evidence[payment_index]
+    evidence[payment_index] = payment.model_copy(
+        update={"structured_fields": {**payment.structured_fields, "amount_cents": 9_900}}
+    )
+
+    verification = verify_evidence(
+        evidence=evidence,
+        cited_evidence_ids=[item.evidence_id for item in evidence],
+    )
+    validation = validate_duplicate_charge(evidence)
+
+    assert verification.verified is False
+    assert "payment_invoice_mismatch" in verification.contradictions
+    assert validation.confirmed is False
+    assert validation.reason_code == "contradictory_evidence"
+
+
+def test_run_shell_persists_escalation_as_the_terminal_outcome() -> None:
+    persistence = FakePersistence()
+    lease = ExecutionLease(
+        run_id=RUN_ID,
+        token=UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        attempt=1,
+        expires_at=NOW + timedelta(minutes=1),
+    )
+
+    yielded = list(
+        _execute_shell(
+            repository=cast(DatabaseRunRepository, persistence),
+            principal=Principal(
+                organization_id=ORGANIZATION_ID,
+                user_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+                roles=frozenset({"operator"}),
+            ),
+            lease=lease,
+            read_tools=ReadOnlyToolset(MissingPolicyBackend(), now=lambda: NOW),
+        )
+    )
+
+    assert yielded[-1].event_type is WorkflowEventType.RUN_ESCALATED
+    assert WorkflowEventType.RUN_COMPLETED not in {event.event_type for event in yielded}
