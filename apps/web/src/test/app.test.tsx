@@ -26,7 +26,11 @@ const supportCase = {
 };
 
 function workflowRun(
-  status: "created" | "running" | "completed" = "completed",
+  status:
+    | "created"
+    | "running"
+    | "waiting_for_approval"
+    | "completed" = "completed",
 ) {
   return {
     run_id: RUN_ID,
@@ -35,7 +39,12 @@ function workflowRun(
     thread_id: RUN_ID,
     initiated_by: USER_ID,
     status,
-    current_node: status === "running" ? "collect_initial_evidence" : null,
+    current_node:
+      status === "running"
+        ? "collect_initial_evidence"
+        : status === "waiting_for_approval"
+          ? "approval_gate"
+          : null,
     graph_version: "1.0.0",
     prompt_bundle_version: "1.0.0",
     dataset_version: "v1",
@@ -70,6 +79,20 @@ function completionEvent() {
     public_payload: { summary: "Synthetic investigation completed." },
     payload_hash: "a".repeat(64),
     created_at: "2026-07-22T12:00:04Z",
+  };
+}
+
+function approvalRequestedEvent() {
+  return {
+    event_id: 2,
+    run_id: RUN_ID,
+    sequence: 2,
+    event_type: "approval.requested",
+    node_name: "approval_gate",
+    status: "waiting_for_approval",
+    public_payload: { summary: "Approval required before synthetic credit." },
+    payload_hash: "b".repeat(64),
+    created_at: "2026-07-22T12:00:05Z",
   };
 }
 
@@ -210,6 +233,48 @@ describe("case workflow surface", () => {
       screen.getByText("Synthetic investigation completed."),
     ).toBeInTheDocument();
     expect(screen.getByText("terminal")).toBeInTheDocument();
+  });
+
+  test("an interrupted stream settles when polling finds approval is required", async () => {
+    let runReads = 0;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith(`/cases/${CASE_ID}`)) return jsonResponse(supportCase);
+        if (url.endsWith(`/runs/${RUN_ID}`)) {
+          runReads += 1;
+          return jsonResponse(
+            workflowRun(runReads === 1 ? "created" : "waiting_for_approval"),
+          );
+        }
+        if (url.includes(`/runs/${RUN_ID}/events`)) {
+          return jsonResponse(
+            eventPage(runReads === 1 ? [] : [approvalRequestedEvent()]),
+          );
+        }
+        if (
+          url.endsWith(`/runs/${RUN_ID}/execute`) &&
+          init?.method === "POST"
+        ) {
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new Error("simulated disconnect"));
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "text/event-stream" } },
+          );
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderRoute(`/app/runs/${RUN_ID}`);
+
+    expect(
+      await screen.findByText("Approval required before synthetic credit."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("connected")).toBeInTheDocument();
   });
 
   test("a running stream always shows node and elapsed state instead of an indefinite spinner", async () => {

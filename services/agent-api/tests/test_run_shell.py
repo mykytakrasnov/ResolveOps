@@ -729,8 +729,22 @@ def test_approval_gate_persists_immutable_proposal_checkpoint_and_waiting_state(
                 if channel == "__interrupt__"
             ]
             assert len(interrupt_writes) == 1
-            assert interrupt_writes[0][0].value["proposal_id"] == str(proposal[0])
-            assert interrupt_writes[0][0].value["proposal_hash"] == proposal[4]
+            interrupt_payload = interrupt_writes[0][0].value
+            assert "proposal_id" not in interrupt_payload
+            assert "approval_request_id" not in interrupt_payload
+            assert interrupt_payload == {
+                "action_type": "apply_account_credit",
+                "target_reference": str(TEST_ACCOUNT_ID),
+                "canonical_parameters": {
+                    "account_id": str(TEST_ACCOUNT_ID),
+                    "amount_cents": 4_900,
+                    "currency": "USD",
+                },
+                "risk_level": "R2",
+                "policy_key": "billing_duplicate_credit",
+                "policy_version": "3.0",
+                "reason_code": "credit_requires_approval",
+            }
             return checkpoint
 
     assert asyncio.run(reload_checkpoint()) is not None

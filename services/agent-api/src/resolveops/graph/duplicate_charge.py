@@ -349,11 +349,7 @@ def build_duplicate_charge_graph(
         APPROVAL_GATE,
         cast(
             Any,
-            _approval_gate_node(
-                persistence=persistence,
-                lease=lease,
-                organization_id=organization_id,
-            )
+            _approval_gate_node()
             if enable_approval_interrupt
             else _with_node_events(
                 APPROVAL_GATE,
@@ -819,26 +815,18 @@ def _request_approval(state: DuplicateChargeState) -> DuplicateChargeState:
     return {"workflow_outcome": WorkflowOutcome.APPROVAL_REQUIRED}
 
 
-def _approval_gate_node(
-    *,
-    persistence: WorkflowPersistence,
-    lease: ExecutionLease,
-    organization_id: UUID,
-) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+def _approval_gate_node() -> Callable[[DuplicateChargeState], DuplicateChargeState]:
     def node(state: DuplicateChargeState) -> DuplicateChargeState:
         decision = state["policy_decision"]
-        records = persistence.create_approval_gate_records(
-            lease=lease,
-            organization_id=organization_id,
-            decision=decision,
-        )
         interrupt(
             {
-                "proposal_id": str(records.proposal.proposal_id),
-                "proposal_hash": records.proposal.proposal_hash,
-                "risk_level": records.proposal.risk_level.value,
-                "policy_key": records.proposal.policy_key,
-                "policy_version": records.proposal.policy_version,
+                "action_type": decision.action_type.value if decision.action_type else None,
+                "target_reference": decision.target_reference,
+                "canonical_parameters": cast(JsonValue, decision.canonical_parameters),
+                "risk_level": decision.risk_level.value,
+                "policy_key": decision.policy_key,
+                "policy_version": decision.policy_version,
+                "reason_code": decision.reason_code,
             }
         )
         # Resume and decision handling belong to a later issue. Even a caller that

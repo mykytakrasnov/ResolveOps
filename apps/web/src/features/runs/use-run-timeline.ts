@@ -14,6 +14,12 @@ export type ConnectionState =
 const TERMINAL_STATUSES = new Set(["completed", "escalated", "failed"]);
 const POLL_DELAY_MS = 1_500;
 
+function connectionStateForRun(status: string): ConnectionState | null {
+  if (TERMINAL_STATUSES.has(status)) return "terminal";
+  if (status === "waiting_for_approval") return "connected";
+  return null;
+}
+
 function mergeEvents(current: WorkflowEvent[], incoming: WorkflowEvent[]) {
   const events = new Map(current.map((event) => [event.sequence, event]));
   for (const event of incoming) events.set(event.sequence, event);
@@ -58,8 +64,9 @@ export function useRunTimeline(runId: string) {
       setConnectionState("polling");
       try {
         const nextRun = await refreshSnapshot();
-        if (TERMINAL_STATUSES.has(nextRun.status)) {
-          setConnectionState("terminal");
+        const settledState = connectionStateForRun(nextRun.status);
+        if (settledState) {
+          setConnectionState(settledState);
           return;
         }
         pollTimer = setTimeout(pollUntilTerminal, POLL_DELAY_MS);
@@ -75,12 +82,9 @@ export function useRunTimeline(runId: string) {
     const start = async () => {
       try {
         const initialRun = await refreshSnapshot();
-        if (TERMINAL_STATUSES.has(initialRun.status)) {
-          setConnectionState("terminal");
-          return;
-        }
-        if (initialRun.status === "waiting_for_approval") {
-          setConnectionState("connected");
+        const initialSettledState = connectionStateForRun(initialRun.status);
+        if (initialSettledState) {
+          setConnectionState(initialSettledState);
           return;
         }
         setConnectionState("streaming");
@@ -90,7 +94,7 @@ export function useRunTimeline(runId: string) {
           );
           const finalRun = await refreshSnapshot();
           setConnectionState(
-            TERMINAL_STATUSES.has(finalRun.status) ? "terminal" : "connected",
+            connectionStateForRun(finalRun.status) ?? "connected",
           );
         } catch (error) {
           if (controller.signal.aborted) return;
