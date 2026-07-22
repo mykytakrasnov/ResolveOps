@@ -17,6 +17,11 @@
     "enabled": true,
     "indentStyle": "space"
   },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
   "linter": {
     "enabled": true,
     "rules": {

@@ -18,6 +18,7 @@ dev = [
   "mypy==1.18.2",
   "pytest==8.4.2",
   "ruff==0.14.0",
+  "uvicorn==0.35.0",
 ]
 
 [tool.uv]

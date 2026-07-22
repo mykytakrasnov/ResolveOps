@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test } from "vitest";
 
+import { FileObjectStorage } from "../../dev/filesystem-storage.ts";
 import {
   createSyntheticApi,
   InMemoryNonceStore,
@@ -28,6 +32,7 @@ function fixtureObjects() {
       category: "duplicate_charge",
       difficulty: "medium",
       curated: true,
+      expected_approval_required: true,
       subject: "Charged twice",
       body: "Two synthetic charges appear for one period.",
       customer_reference: "org_atlas_001",
@@ -164,6 +169,7 @@ test("public routes list curated cases and return a redacted case", async () => 
   const list = await listResponse.json();
   assert.equal(list.items.length, 1);
   assert.equal(list.items[0].case_id, CASE_ID);
+  assert.equal(list.items[0].expected_approval_required, true);
   assert.equal(list.items[0].resolution_code, undefined);
   assert.equal(list.items[0].expected_evidence_ids, undefined);
   assert.equal(list.items[0].hidden_truth, undefined);
@@ -174,8 +180,43 @@ test("public routes list curated cases and return a redacted case", async () => 
   assert.equal(detailResponse.status, 200);
   const detail = await detailResponse.json();
   assert.equal(detail.case_id, CASE_ID);
+  assert.equal(detail.expected_approval_required, true);
   assert.equal(detail.resolution_code, undefined);
   assert.equal(detail.hidden_truth, undefined);
+});
+
+test("local filesystem storage serves generated synthetic case routes", async () => {
+  const fixtureRoot = await mkdtemp(
+    path.join(tmpdir(), "resolveops-synthetic-api-"),
+  );
+  try {
+    const objects = fixtureObjects();
+    await Promise.all(
+      Object.entries(objects).map(async ([key, value]) => {
+        const destination = path.join(fixtureRoot, key);
+        await mkdir(path.dirname(destination), { recursive: true });
+        await writeFile(destination, value, "utf8");
+      }),
+    );
+    const api = createSyntheticApi({
+      storage: new FileObjectStorage(fixtureRoot),
+      hmacSecret: SECRET,
+      nonceStore: new InMemoryNonceStore(),
+      now: () => NOW,
+    });
+
+    const response = await api.fetch(
+      new Request("http://resolveops.local/api/v1/cases?limit=10"),
+    );
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(
+      (await response.json()).items.map((item) => item.case_id),
+      [CASE_ID],
+    );
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test("service routes return typed CRM, billing, payment, policy, and status data", async () => {

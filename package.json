@@ -8,6 +8,8 @@
     "pnpm": "11.0.7"
   },
   "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:down": "docker compose stop postgres",
     "format": "biome format --write .",
     "format:check": "biome format .",
     "lint": "biome lint .",

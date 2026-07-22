@@ -149,6 +149,7 @@ class PublicCase(FixtureModel):
     category: CaseCategory
     difficulty: str
     curated: bool
+    expected_approval_required: bool
     subject: str
     body: str
     customer_reference: str = Field(pattern=r"^org_atlas_\d{3}$")
@@ -626,6 +627,7 @@ def _build_cases(
                 category=category,
                 difficulty=("easy", "medium", "hard")[case_index % 3],
                 curated=case_index in curated_indexes,
+                expected_approval_required=is_special,
                 subject=subjects[category],
                 body=(
                     "We upgraded yesterday and see two completed charges for the same period."
@@ -966,6 +968,11 @@ def validate_dataset(dataset: DatasetBundle) -> None:
         raise ValueError("public and ground-truth case identifiers must match")
     if any(item.customer_reference not in account_refs for item in dataset.public_cases):
         raise ValueError("public case references an unknown customer")
+    if any(
+        public_by_id[case_id].expected_approval_required != truth.approval_required
+        for case_id, truth in truth_by_id.items()
+    ):
+        raise ValueError("public approval expectation must match ground truth")
 
     evidence_owners: dict[str, UUID | None] = {
         **{f"crm:{item.account_id}": item.account_id for item in dataset.crm_accounts},

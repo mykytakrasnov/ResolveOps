@@ -61,6 +61,25 @@ Run `make contracts-generate` after changing a contract. It deterministically up
 
 ## Local PostgreSQL and MinIO
 
+To run the complete synthetic case workflow, use the single repository-root command:
+
+```bash
+source /home/redbeb/.nvm/nvm.sh && nvm use 22.22.3 >/dev/null && pnpm run dev
+```
+
+It starts PostgreSQL, regenerates deterministic AtlasFlow fixtures, applies migrations, seeds
+the bounded demo operator and cases, and then supervises the Agent API and Vite app. Open
+<http://127.0.0.1:5173/app/cases>. Press Ctrl+C to stop the application processes. Run
+`pnpm run dev:down` when you also want to stop PostgreSQL.
+
+The Vite development gateway mounts the same validated synthetic case handlers used by the
+Cloudflare Worker and proxies durable run routes to the local Agent API. It reads only generated
+AtlasFlow fixtures and never enables real customer data or real side effects.
+
+When neither database URL is configured, the command manages the repository's PostgreSQL
+container and automatically avoids an occupied default port. Setting `DATABASE_URL_POOLED` or
+`DATABASE_URL_DIRECT` opts into that configured database instead of starting the container.
+
 Copy `.env.example` to `.env` only when you need to override local defaults. The checked-in
 defaults are synthetic development credentials and must not be reused outside local development.
 

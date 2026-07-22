@@ -64,11 +64,23 @@ def test_curated_duplicate_charge_case_has_separate_coherent_truth(
     assert all("hidden_truth" not in case for case in public_cases)
     assert all("resolution_code" not in case for case in public_cases)
     assert all("expected_evidence_ids" not in case for case in public_cases)
+    assert duplicate_case["expected_approval_required"] is True
     truth_path = dataset_root / "cases/ground-truth" / f"{duplicate_case['case_id']}.yaml"
     truth = json.loads(truth_path.read_text())
     assert truth["case_id"] == duplicate_case["case_id"]
     assert truth["resolution_code"] == "duplicate_charge_confirmed"
     assert truth["approval_required"] is True
+
+    no_approval_case = next(
+        case
+        for case in public_cases
+        if case["curated"] and case["case_id"] != duplicate_case["case_id"]
+    )
+    no_approval_truth = json.loads(
+        (dataset_root / "cases/ground-truth" / f"{no_approval_case['case_id']}.yaml").read_text()
+    )
+    assert no_approval_case["expected_approval_required"] is False
+    assert no_approval_truth["approval_required"] is False
 
     invoice_id = truth["expected_invoice_id"]
     invoice = json.loads((dataset_root / "billing/invoices" / f"{invoice_id}.json").read_text())
@@ -197,6 +209,19 @@ def test_dataset_rejects_unsafe_shapes_and_broken_references() -> None:
     )
     with pytest.raises(ValueError, match="another account"):
         validate_dataset(wrong_owner_dataset)
+
+    mismatched_public_approval_dataset = build_dataset()
+    mismatched_public_approval_dataset.public_cases[0] = (
+        mismatched_public_approval_dataset.public_cases[0].model_copy(
+            update={
+                "expected_approval_required": not mismatched_public_approval_dataset.public_cases[
+                    0
+                ].expected_approval_required
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="approval expectation"):
+        validate_dataset(mismatched_public_approval_dataset)
 
     mismatched_invoice_dataset = build_dataset()
     mismatched_invoice_dataset.ground_truth[1] = mismatched_invoice_dataset.ground_truth[

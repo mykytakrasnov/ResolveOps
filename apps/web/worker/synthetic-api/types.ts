@@ -4,6 +4,7 @@ export interface PublicCase {
   category: string;
   difficulty: string;
   curated: boolean;
+  expected_approval_required: boolean;
   subject: string;
   body: string;
   customer_reference: string;
