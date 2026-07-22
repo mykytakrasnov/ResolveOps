@@ -32,6 +32,8 @@ jobs:
         run: pnpm lint
       - name: Typecheck
         run: pnpm typecheck
+      - name: Test Worker contracts
+        run: pnpm test
 
   python:
     name: Python checks

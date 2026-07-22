@@ -2,7 +2,15 @@
   "name": "@resolveops/web",
   "version": "0.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
+    "test": "vitest run",
     "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "hono": "4.12.31"
+  },
+  "devDependencies": {
+    "vitest": "4.1.10"
   }
 }
