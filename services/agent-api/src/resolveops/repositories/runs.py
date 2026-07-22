@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import psycopg
 from psycopg.rows import dict_row
@@ -16,7 +16,11 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel, JsonValue
 
 from resolveops.models.contracts import (
+    ActionProposal,
+    ApprovalRequest,
     ArtifactKind,
+    PolicyDecision,
+    ProposalStatus,
     ReadToolName,
     RunArtifact,
     RunError,
@@ -68,6 +72,10 @@ class LostExecutionLeaseError(RunRepositoryError):
     pass
 
 
+class ProposalReplayConflictError(RunRepositoryError):
+    pass
+
+
 @dataclass(frozen=True)
 class CreatedRun:
     run: WorkflowRun
@@ -92,6 +100,12 @@ class ExecutionStart:
 class RunCase:
     ticket: TicketInput
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class ApprovalGateRecords:
+    proposal: ActionProposal
+    approval_request: ApprovalRequest
 
 
 def _canonical_json(value: object) -> str:
@@ -616,7 +630,8 @@ class DatabaseRunRepository:
                     """
                     UPDATE app.workflow_runs
                     SET status = %s,
-                        current_node = NULL,
+                        current_node = CASE WHEN %s = 'waiting_for_approval'
+                                            THEN %s ELSE NULL END,
                         completed_at = CASE WHEN %s IN ('completed', 'escalated', 'failed')
                                             THEN CURRENT_TIMESTAMP ELSE completed_at END,
                         execution_lease_token = NULL,
@@ -627,6 +642,8 @@ class DatabaseRunRepository:
                     """,
                     (
                         final_status.value,
+                        final_status.value,
+                        node_name,
                         final_status.value,
                         final_error_code,
                         lease.run_id,
@@ -731,6 +748,197 @@ class DatabaseRunRepository:
             if row is None:  # pragma: no cover - INSERT/UPDATE RETURNING contract
                 raise RunRepositoryError("artifact persistence returned no row")
             return _artifact_from_row(row)
+
+    def create_approval_gate_records(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        decision: PolicyDecision,
+    ) -> ApprovalGateRecords:
+        """Persist one immutable policy-derived proposal and undecided request."""
+
+        if (
+            not decision.approval_required
+            or decision.action_type is None
+            or decision.target_reference is None
+            or not decision.canonical_parameters
+            or decision.policy_key is None
+            or decision.policy_version is None
+        ):
+            raise RunRepositoryError("approval gate requires a complete policy decision")
+
+        canonical_parameters = json.loads(_canonical_json(decision.canonical_parameters))
+        proposal_payload = {
+            "action_type": decision.action_type.value,
+            "target_reference": decision.target_reference,
+            "canonical_parameters": canonical_parameters,
+            "risk_level": decision.risk_level.value,
+            "policy_key": decision.policy_key,
+            "policy_version": decision.policy_version,
+        }
+        proposal_hash = _sha256(proposal_payload)
+        proposal_id = uuid5(lease.run_id, "resolveops:action-proposal:v1")
+        request_id = uuid5(lease.run_id, "resolveops:approval-request:v1")
+        idempotency_key = f"resolveops:{lease.run_id}:{decision.action_type.value}:v1"
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            self._lock_owned_lease(cursor, lease=lease, organization_id=organization_id)
+            cursor.execute(
+                "SELECT initiated_by FROM app.workflow_runs WHERE id = %s FOR UPDATE",
+                (lease.run_id,),
+            )
+            run_row = cursor.fetchone()
+            if run_row is None:  # pragma: no cover - lease lock already proved the row exists
+                raise RunRepositoryError("run disappeared while creating approval request")
+            requested_by = run_row["initiated_by"]
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"approval-gate:{lease.run_id}",),
+            )
+            cursor.execute(
+                "SELECT * FROM app.action_proposals WHERE run_id = %s FOR UPDATE",
+                (lease.run_id,),
+            )
+            proposal_row = cursor.fetchone()
+            if proposal_row is None:
+                cursor.execute(
+                    """
+                    INSERT INTO app.action_proposals (
+                        id, run_id, action_type, target_reference, canonical_parameters,
+                        proposal_hash, risk_level, policy_key, policy_version, status,
+                        idempotency_key
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending_approval', %s)
+                    RETURNING *
+                    """,
+                    (
+                        proposal_id,
+                        lease.run_id,
+                        decision.action_type.value,
+                        decision.target_reference,
+                        Jsonb(canonical_parameters),
+                        proposal_hash,
+                        decision.risk_level.value,
+                        decision.policy_key,
+                        decision.policy_version,
+                        idempotency_key,
+                    ),
+                )
+                proposal_row = cursor.fetchone()
+            if proposal_row is None:  # pragma: no cover - INSERT RETURNING contract
+                raise RunRepositoryError("proposal persistence returned no row")
+
+            expected = {
+                "id": proposal_id,
+                "action_type": decision.action_type.value,
+                "target_reference": decision.target_reference,
+                "canonical_parameters": canonical_parameters,
+                "proposal_hash": proposal_hash,
+                "risk_level": decision.risk_level.value,
+                "policy_key": decision.policy_key,
+                "policy_version": decision.policy_version,
+                "status": ProposalStatus.PENDING_APPROVAL.value,
+                "idempotency_key": idempotency_key,
+            }
+            if any(proposal_row[key] != value for key, value in expected.items()):
+                raise ProposalReplayConflictError(
+                    "approval proposal replay differs from the persisted proposal"
+                )
+
+            cursor.execute(
+                "SELECT * FROM app.approval_requests WHERE proposal_id = %s FOR UPDATE",
+                (proposal_id,),
+            )
+            request_row = cursor.fetchone()
+            if request_row is None:
+                cursor.execute(
+                    """
+                    INSERT INTO app.approval_requests (id, proposal_id, requested_by)
+                    VALUES (%s, %s, %s)
+                    RETURNING *
+                    """,
+                    (request_id, proposal_id, requested_by),
+                )
+                request_row = cursor.fetchone()
+            if request_row is None:  # pragma: no cover - INSERT RETURNING contract
+                raise RunRepositoryError("approval request persistence returned no row")
+            if (
+                request_row["id"] != request_id
+                or request_row["requested_by"] != requested_by
+                or request_row["decision"] is not None
+                or request_row["decided_by"] is not None
+                or request_row["comment"] is not None
+                or request_row["decided_at"] is not None
+            ):
+                raise ProposalReplayConflictError(
+                    "approval request replay differs from the undecided request"
+                )
+
+            proposal = _proposal_from_row(proposal_row)
+            return ApprovalGateRecords(
+                proposal=proposal,
+                approval_request=_approval_request_from_row(request_row, proposal=proposal),
+            )
+
+    def mark_waiting_for_approval(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        records: ApprovalGateRecords,
+    ) -> WorkflowEvent:
+        """Publish the approval request only after its graph checkpoint is durable."""
+
+        if (
+            records.proposal.run_id != lease.run_id
+            or records.approval_request.proposal.proposal_id != records.proposal.proposal_id
+            or records.approval_request.decision is not None
+        ):
+            raise RunRepositoryError("approval records do not belong to the active run")
+        with self._connect() as connection, connection.cursor() as cursor:
+            self._lock_owned_lease(cursor, lease=lease, organization_id=organization_id)
+            cursor.execute(
+                """
+                SELECT 1
+                FROM app.action_proposals AS proposal
+                JOIN app.approval_requests AS request
+                  ON request.proposal_id = proposal.id
+                WHERE proposal.id = %s
+                  AND proposal.run_id = %s
+                  AND proposal.proposal_hash = %s
+                  AND request.id = %s
+                  AND request.decision IS NULL
+                  AND request.decided_by IS NULL
+                  AND request.comment IS NULL
+                  AND request.decided_at IS NULL
+                """,
+                (
+                    records.proposal.proposal_id,
+                    lease.run_id,
+                    records.proposal.proposal_hash,
+                    records.approval_request.request_id,
+                ),
+            )
+            if cursor.fetchone() is None:
+                raise RunRepositoryError("persisted approval records do not match the active run")
+
+        return self.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.APPROVAL_REQUESTED,
+            node_name="approval_gate",
+            status="waiting_for_approval",
+            public_payload={
+                "proposal_id": str(records.proposal.proposal_id),
+                "approval_request_id": str(records.approval_request.request_id),
+                "proposal_hash": records.proposal.proposal_hash,
+                "action_type": records.proposal.action_type.value,
+                "risk_level": records.proposal.risk_level.value,
+                "policy_key": records.proposal.policy_key,
+                "policy_version": records.proposal.policy_version,
+            },
+            final_status=RunStatus.WAITING_FOR_APPROVAL,
+        )
 
     def start_tool_attempt(
         self,
@@ -884,4 +1092,37 @@ def _artifact_from_row(row: dict[str, Any]) -> RunArtifact:
         sha256=row["sha256"],
         size_bytes=row["size_bytes"],
         created_at=row["created_at"],
+    )
+
+
+def _proposal_from_row(row: dict[str, Any]) -> ActionProposal:
+    return ActionProposal(
+        proposal_id=row["id"],
+        run_id=row["run_id"],
+        action_type=row["action_type"],
+        target_reference=row["target_reference"],
+        canonical_parameters=row["canonical_parameters"],
+        proposal_hash=row["proposal_hash"],
+        risk_level=row["risk_level"],
+        policy_key=row["policy_key"],
+        policy_version=row["policy_version"],
+        status=row["status"],
+        idempotency_key=row["idempotency_key"],
+        created_at=row["created_at"],
+    )
+
+
+def _approval_request_from_row(
+    row: dict[str, Any],
+    *,
+    proposal: ActionProposal,
+) -> ApprovalRequest:
+    if row["decision"] is not None:
+        raise RunRepositoryError("decided approval requests are outside this workflow slice")
+    return ApprovalRequest(
+        request_id=row["id"],
+        proposal=proposal,
+        requested_by=row["requested_by"],
+        requested_at=row["requested_at"],
+        decision=None,
     )

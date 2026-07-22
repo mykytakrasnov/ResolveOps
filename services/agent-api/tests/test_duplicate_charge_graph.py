@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
+import pytest
 from pydantic import BaseModel, JsonValue
 
 from resolveops.api.runs import Principal, _execute_shell, _start_independent_execution
@@ -327,6 +328,10 @@ class FakePersistence:
         )
         self.artifacts.append(artifact)
         return artifact
+
+    def create_approval_gate_records(self, **kwargs: object) -> Any:
+        del kwargs
+        raise AssertionError("the non-checkpointed unit graph must not persist approval records")
 
 
 class FailingObjectStorage:
@@ -745,27 +750,22 @@ def test_approval_required_is_not_finalized_as_successful() -> None:
         expires_at=NOW + timedelta(minutes=1),
     )
 
-    yielded = list(
-        _execute_shell(
-            repository=cast(DatabaseRunRepository, persistence),
-            principal=Principal(
-                organization_id=ORGANIZATION_ID,
-                user_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
-                roles=frozenset({"operator"}),
-            ),
-            lease=lease,
-            read_tools=ReadOnlyToolset(FakeBackend(), now=lambda: NOW),
-            object_storage=persistence.storage,
+    with pytest.raises(RuntimeError, match="needs durable checkpoint persistence"):
+        list(
+            _execute_shell(
+                repository=cast(DatabaseRunRepository, persistence),
+                principal=Principal(
+                    organization_id=ORGANIZATION_ID,
+                    user_id=UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+                    roles=frozenset({"operator"}),
+                ),
+                lease=lease,
+                read_tools=ReadOnlyToolset(FakeBackend(), now=lambda: NOW),
+                object_storage=persistence.storage,
+            )
         )
-    )
 
-    assert yielded[-1].event_type is WorkflowEventType.RUN_FAILED
-    assert yielded[-1].public_payload == {
-        "error_code": "approval_flow_not_implemented",
-        "recoverable": True,
-        "workflow_outcome": "approval_required",
-    }
-    assert WorkflowEventType.RUN_COMPLETED not in {event.event_type for event in yielded}
+    assert WorkflowEventType.RUN_COMPLETED not in {event.event_type for event in persistence.events}
     assert persistence.artifacts == []
 
 

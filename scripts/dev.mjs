@@ -26,6 +26,8 @@ const databaseUrlPooled =
   process.env.DATABASE_URL_DIRECT ??
   defaultDatabaseUrl;
 const databaseUrlDirect = process.env.DATABASE_URL_DIRECT ?? databaseUrlPooled;
+const databaseUrlCheckpoint =
+  process.env.DATABASE_URL_CHECKPOINT ?? databaseUrlPooled;
 const agentApiPort = process.env.RESOLVEOPS_AGENT_API_PORT ?? "8000";
 const webPort = process.env.RESOLVEOPS_WEB_PORT ?? "5173";
 const generatedRoot = path.join(repositoryRoot, "data/generated");
@@ -35,6 +37,7 @@ const pythonSource = path.join(repositoryRoot, "services/agent-api/src");
 const environment = {
   ...process.env,
   DATABASE_URL_DIRECT: databaseUrlDirect,
+  DATABASE_URL_CHECKPOINT: databaseUrlCheckpoint,
   DATABASE_URL_POOLED: databaseUrlPooled,
   POSTGRES_PORT: postgresPort,
   PYTHONPATH: [pythonSource, process.env.PYTHONPATH]
@@ -187,6 +190,17 @@ try {
     "services/agent-api/alembic.ini",
     "upgrade",
     "head",
+  ]);
+
+  console.log("[resolveops] applying LangGraph checkpoint migrations");
+  run("uv", [
+    "run",
+    "--project",
+    "services/agent-api",
+    "python",
+    "-m",
+    "resolveops.db.checkpoints",
+    "setup",
   ]);
 
   console.log("[resolveops] seeding the bounded local demo tenant");

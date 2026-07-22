@@ -20,6 +20,7 @@ def create_app(
     repository: DatabaseRunRepository | None = None,
     read_tools: ReadOnlyToolset | None = None,
     object_storage: ObjectStorage | None = None,
+    checkpoint_dsn: str | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -47,6 +48,13 @@ def create_app(
             object_storage_root = os.getenv("RESOLVEOPS_OBJECT_STORAGE_ROOT")
             if object_storage_root:
                 application.state.object_storage = LocalObjectStorage(Path(object_storage_root))
+        configured_checkpoint_dsn = (
+            checkpoint_dsn
+            or os.getenv("DATABASE_URL_CHECKPOINT")
+            or os.getenv("DATABASE_URL_POOLED")
+        )
+        if configured_checkpoint_dsn:
+            application.state.checkpoint_dsn = configured_checkpoint_dsn
         yield
 
     application = FastAPI(title="ResolveOps Agent API", version="0.0.0", lifespan=lifespan)

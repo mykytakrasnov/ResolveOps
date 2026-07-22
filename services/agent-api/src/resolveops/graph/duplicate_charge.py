@@ -5,14 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol, cast
 from uuid import UUID
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import interrupt
 from pydantic import BaseModel, JsonValue
 
+from resolveops.db.checkpoints import open_async_postgres_saver
 from resolveops.graph.state import DuplicateChargeState
 from resolveops.models.contracts import (
     ArtifactKind,
@@ -39,7 +43,7 @@ from resolveops.policies.duplicate_charge import (
     validate_duplicate_charge,
     verify_evidence,
 )
-from resolveops.repositories.runs import ExecutionLease
+from resolveops.repositories.runs import ApprovalGateRecords, ExecutionLease
 from resolveops.storage.artifacts import ObjectStorage, StoredObject
 from resolveops.tools.contracts import (
     CustomerRecord,
@@ -67,7 +71,8 @@ ENFORCE_POLICY = "enforce_policy"
 ESCALATE_CASE = "escalate_case"
 DRAFT_RESPONSE = "draft_response"
 FINALIZE_RUN = "finalize_run"
-REQUEST_APPROVAL = "request_approval"
+APPROVAL_GATE = "approval_gate"
+REQUEST_APPROVAL = APPROVAL_GATE
 DUPLICATE_CHARGE_RECIPE = "duplicate_charge_v1"
 BILLING_POLICY_KEY = "billing_duplicate_credit"
 BILLING_POLICY_VERSION = "3.0"
@@ -116,6 +121,22 @@ class WorkflowPersistence(Protocol):
         kind: ArtifactKind,
         stored_object: StoredObject,
     ) -> RunArtifact: ...
+
+    def create_approval_gate_records(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        decision: PolicyDecision,
+    ) -> ApprovalGateRecords: ...
+
+
+@dataclass(frozen=True)
+class CheckpointedGraphExecution:
+    events: list[WorkflowEvent]
+    workflow_outcome: WorkflowOutcome
+    outcome_reason_code: str
+    approval_records: ApprovalGateRecords | None = None
 
 
 class _PersistingObserver(ToolAttemptObserver):
@@ -218,6 +239,8 @@ def build_duplicate_charge_graph(
     object_storage: ObjectStorage,
     lease: ExecutionLease,
     organization_id: UUID,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
+    enable_approval_interrupt: bool = False,
 ) -> CompiledStateGraph[DuplicateChargeState, None, Any, Any]:
     """Build the bounded duplicate-charge investigation and policy graph."""
 
@@ -308,10 +331,7 @@ def build_duplicate_charge_graph(
             ),
         ),
     )
-    for node_name, operation in (
-        (ESCALATE_CASE, _escalate_case),
-        (REQUEST_APPROVAL, _request_approval),
-    ):
+    for node_name, operation in ((ESCALATE_CASE, _escalate_case),):
         graph.add_node(
             node_name,
             cast(
@@ -325,6 +345,25 @@ def build_duplicate_charge_graph(
                 ),
             ),
         )
+    graph.add_node(
+        APPROVAL_GATE,
+        cast(
+            Any,
+            _approval_gate_node(
+                persistence=persistence,
+                lease=lease,
+                organization_id=organization_id,
+            )
+            if enable_approval_interrupt
+            else _with_node_events(
+                APPROVAL_GATE,
+                persistence,
+                lease,
+                organization_id,
+                _request_approval,
+            ),
+        ),
+    )
     graph.add_node(
         DRAFT_RESPONSE,
         cast(
@@ -361,14 +400,14 @@ def build_duplicate_charge_graph(
         {
             WorkflowOutcome.ESCALATE.value: ESCALATE_CASE,
             WorkflowOutcome.NO_ACTION.value: DRAFT_RESPONSE,
-            WorkflowOutcome.APPROVAL_REQUIRED.value: REQUEST_APPROVAL,
+            WorkflowOutcome.APPROVAL_REQUIRED.value: APPROVAL_GATE,
         },
     )
     graph.add_edge(ESCALATE_CASE, DRAFT_RESPONSE)
     graph.add_edge(DRAFT_RESPONSE, FINALIZE_RUN)
     graph.add_edge(FINALIZE_RUN, END)
-    graph.add_edge(REQUEST_APPROVAL, END)
-    return graph.compile()
+    graph.add_edge(APPROVAL_GATE, END)
+    return graph.compile(checkpointer=checkpointer)
 
 
 def execute_duplicate_charge_graph(
@@ -415,6 +454,90 @@ def execute_duplicate_charge_graph(
     if workflow_outcome is None or outcome_reason_code is None:
         raise RuntimeError("duplicate-charge graph completed without a policy outcome")
     return workflow_outcome, outcome_reason_code
+
+
+async def execute_checkpointed_duplicate_charge_graph(
+    *,
+    tools: ReadOnlyToolset,
+    persistence: WorkflowPersistence,
+    object_storage: ObjectStorage,
+    lease: ExecutionLease,
+    organization_id: UUID,
+    ticket: TicketInput,
+    case_created_at: datetime,
+    checkpoint_dsn: str,
+) -> CheckpointedGraphExecution:
+    """Execute with durable PostgreSQL state and verify an interrupt before returning."""
+
+    initial: DuplicateChargeState = {
+        "run_id": lease.run_id,
+        "organization_id": organization_id,
+        "ticket": ticket,
+        "case_created_at": case_created_at.isoformat(),
+        "evidence": [],
+        "tool_errors": [],
+        "emitted_events": [],
+    }
+    config: dict[str, Any] = {"configurable": {"thread_id": str(lease.run_id)}}
+    events: list[WorkflowEvent] = []
+    decision: PolicyDecision | None = None
+    workflow_outcome: WorkflowOutcome | None = None
+
+    async with open_async_postgres_saver(checkpoint_dsn) as checkpointer:
+        graph = build_duplicate_charge_graph(
+            tools=tools,
+            persistence=persistence,
+            object_storage=object_storage,
+            lease=lease,
+            organization_id=organization_id,
+            checkpointer=checkpointer,
+            enable_approval_interrupt=True,
+        )
+        async for update in graph.astream(
+            initial,
+            config=cast(Any, config),
+            stream_mode="updates",
+        ):
+            for node_update in update.values():
+                if not isinstance(node_update, dict):
+                    continue
+                raw_decision = node_update.get("policy_decision")
+                if isinstance(raw_decision, PolicyDecision):
+                    decision = raw_decision
+                raw_outcome = node_update.get("workflow_outcome")
+                if isinstance(raw_outcome, WorkflowOutcome):
+                    workflow_outcome = raw_outcome
+                events.extend(
+                    event
+                    for event in node_update.get("emitted_events", [])
+                    if isinstance(event, WorkflowEvent)
+                )
+
+        if decision is None:
+            raise RuntimeError("checkpointed graph stopped without a policy decision")
+        if workflow_outcome is None:
+            workflow_outcome = decision.outcome
+
+        approval_records = None
+        if workflow_outcome is WorkflowOutcome.APPROVAL_REQUIRED:
+            checkpoint = await checkpointer.aget_tuple(cast(Any, config))
+            snapshot = await graph.aget_state(cast(Any, config))
+            if checkpoint is None or not any(task.interrupts for task in snapshot.tasks):
+                raise RuntimeError("approval graph stopped without a durable interrupt checkpoint")
+            # The node already inserted these rows before calling interrupt(). Re-read
+            # through the replay-safe seam after checkpoint durability is proven.
+            approval_records = persistence.create_approval_gate_records(
+                lease=lease,
+                organization_id=organization_id,
+                decision=decision,
+            )
+
+    return CheckpointedGraphExecution(
+        events=events,
+        workflow_outcome=workflow_outcome,
+        outcome_reason_code=decision.reason_code,
+        approval_records=approval_records,
+    )
 
 
 def _with_node_events(
@@ -694,6 +817,35 @@ def _escalate_case(state: DuplicateChargeState) -> DuplicateChargeState:
 def _request_approval(state: DuplicateChargeState) -> DuplicateChargeState:
     del state
     return {"workflow_outcome": WorkflowOutcome.APPROVAL_REQUIRED}
+
+
+def _approval_gate_node(
+    *,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+    def node(state: DuplicateChargeState) -> DuplicateChargeState:
+        decision = state["policy_decision"]
+        records = persistence.create_approval_gate_records(
+            lease=lease,
+            organization_id=organization_id,
+            decision=decision,
+        )
+        interrupt(
+            {
+                "proposal_id": str(records.proposal.proposal_id),
+                "proposal_hash": records.proposal.proposal_hash,
+                "risk_level": records.proposal.risk_level.value,
+                "policy_key": records.proposal.policy_key,
+                "policy_version": records.proposal.policy_version,
+            }
+        )
+        # Resume and decision handling belong to a later issue. Even a caller that
+        # manually supplies a resume value cannot cross into action execution here.
+        raise RuntimeError("approval decision resume is not implemented")
+
+    return node
 
 
 def _draft_response_node(

@@ -67,8 +67,9 @@ To run the complete synthetic case workflow, use the single repository-root comm
 source /home/redbeb/.nvm/nvm.sh && nvm use 22.22.3 >/dev/null && pnpm run dev
 ```
 
-It starts PostgreSQL, regenerates deterministic AtlasFlow fixtures, applies migrations, seeds
-the bounded demo operator and cases, and then supervises the Agent API and Vite app. Open
+It starts PostgreSQL, regenerates deterministic AtlasFlow fixtures, applies application and
+LangGraph checkpoint migrations, seeds the bounded demo operator and cases, and then supervises
+the Agent API and Vite app. Open
 <http://127.0.0.1:5173/app/cases>. Press Ctrl+C to stop the application processes. Run
 `pnpm run dev:down` when you also want to stop PostgreSQL.
 
@@ -81,13 +82,15 @@ set `RESOLVEOPS_OBJECT_STORAGE_ROOT` to use a different local development direct
 When neither database URL is configured, the command manages the repository's PostgreSQL
 container and automatically avoids an occupied default port. Setting `DATABASE_URL_POOLED` or
 `DATABASE_URL_DIRECT` opts into that configured database instead of starting the container.
+`DATABASE_URL_CHECKPOINT` may select a dedicated LangGraph runtime connection and otherwise
+defaults to the pooled application URL; checkpoint setup continues to use the direct URL.
 
 Copy `.env.example` to `.env` only when you need to override local defaults. The checked-in
 defaults are synthetic development credentials and must not be reused outside local development.
 
 ```bash
 make infra-up       # PostgreSQL 16, private MinIO bucket, and MinIO console
-make migrate        # upgrade PostgreSQL with DATABASE_URL_DIRECT
+make migrate        # upgrade app and checkpoint schemas with DATABASE_URL_DIRECT
 make infra-down     # stop services; named volumes retain local data
 ```
 

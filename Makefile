@@ -2,7 +2,7 @@ PYTHON_PROJECT := services/agent-api
 PYTHON_SRC := $(CURDIR)/$(PYTHON_PROJECT)/src
 LOCAL_DATABASE_URL := postgresql+psycopg://resolveops:resolveops@localhost:5432/resolveops
 
-.PHONY: bootstrap check contracts-check contracts-generate format format-check generate-data infra-down infra-up lint migrate migration-sql synthetic-data-generate test typecheck
+.PHONY: bootstrap check checkpoint-setup contracts-check contracts-generate format format-check generate-data infra-down infra-up lint migrate migration-sql synthetic-data-generate test typecheck
 
 bootstrap:
 	pnpm install --frozen-lockfile
@@ -46,6 +46,10 @@ infra-down:
 
 migrate:
 	DATABASE_URL_DIRECT=$${DATABASE_URL_DIRECT:-$(LOCAL_DATABASE_URL)} uv run --project $(PYTHON_PROJECT) alembic -c $(PYTHON_PROJECT)/alembic.ini upgrade head
+	DATABASE_URL_DIRECT=$${DATABASE_URL_DIRECT:-$(LOCAL_DATABASE_URL)} PYTHONPATH=$(PYTHON_SRC) uv run --project $(PYTHON_PROJECT) python -m resolveops.db.checkpoints setup
+
+checkpoint-setup:
+	DATABASE_URL_DIRECT=$${DATABASE_URL_DIRECT:-$(LOCAL_DATABASE_URL)} PYTHONPATH=$(PYTHON_SRC) uv run --project $(PYTHON_PROJECT) python -m resolveops.db.checkpoints setup
 
 migration-sql:
 	uv run --project $(PYTHON_PROJECT) alembic -c $(PYTHON_PROJECT)/alembic.ini upgrade head --sql

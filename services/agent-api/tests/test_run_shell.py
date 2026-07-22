@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -24,11 +27,20 @@ from resolveops.api.runs import (
     _start_independent_execution,
     require_principal,
 )
-from resolveops.models.contracts import ArtifactKind, WorkflowEventType
+from resolveops.db.checkpoints import open_async_postgres_saver
+from resolveops.models.contracts import (
+    ActionType,
+    ArtifactKind,
+    PolicyDecision,
+    RiskLevel,
+    WorkflowEventType,
+    WorkflowOutcome,
+)
 from resolveops.repositories.runs import (
     DatabaseRunRepository,
     ExecutionLease,
     LostExecutionLeaseError,
+    ProposalReplayConflictError,
     RunRepositoryError,
 )
 from resolveops.storage.artifacts import InMemoryObjectStorage, StoredObject
@@ -131,6 +143,25 @@ class DatabaseTestBackend:
         )
 
 
+class ApprovalDatabaseTestBackend(DatabaseTestBackend):
+    def get_payment_attempts(self, request: GetPaymentAttemptsInput) -> PaymentAttemptPage:
+        return PaymentAttemptPage(
+            items=[
+                PaymentAttemptRecord(
+                    payment_attempt_id=UUID(int=index),
+                    account_id=request.account_id,
+                    invoice_id=request.invoice_id,
+                    amount_cents=4_900,
+                    currency="USD",
+                    status="succeeded",
+                    processor_reference=f"synthetic_test_payment_{index}",
+                    attempted_at=TEST_NOW,
+                )
+                for index in (1, 2)
+            ]
+        )
+
+
 @dataclass(frozen=True)
 class SeededCase:
     principal: Principal
@@ -162,6 +193,16 @@ def database_url() -> str:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    environment["PYTHONPATH"] = str(service_root / "src")
+    checkpoint_result = subprocess.run(
+        ["uv", "run", "python", "-m", "resolveops.db.checkpoints", "setup"],
+        cwd=service_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checkpoint_result.returncode == 0, checkpoint_result.stdout + checkpoint_result.stderr
     return value
 
 
@@ -213,11 +254,16 @@ def seeded_case(database_url: str) -> SeededCase:
     )
 
 
-def _client(database_url: str, principal: Principal) -> TestClient:
+def _client(
+    database_url: str,
+    principal: Principal,
+    backend: DatabaseTestBackend | None = None,
+) -> TestClient:
     application = create_app(
         DatabaseRunRepository(database_url),
-        ReadOnlyToolset(DatabaseTestBackend(), now=lambda: TEST_NOW),
+        ReadOnlyToolset(backend or DatabaseTestBackend(), now=lambda: TEST_NOW),
         InMemoryObjectStorage(),
+        database_url,
     )
     application.dependency_overrides[require_principal] = lambda: principal
     return TestClient(application)
@@ -280,6 +326,33 @@ def test_execute_fails_closed_when_run_artifact_storage_is_unavailable() -> None
 
     assert response.status_code == 503
     assert response.json()["detail"] == "run artifact storage is unavailable"
+
+
+def test_execute_fails_closed_when_checkpoint_persistence_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DATABASE_URL_CHECKPOINT", raising=False)
+    monkeypatch.delenv("DATABASE_URL_POOLED", raising=False)
+    principal = Principal(
+        organization_id=uuid4(),
+        user_id=uuid4(),
+        roles=frozenset({"operator"}),
+    )
+    application = create_app(
+        DatabaseRunRepository("postgresql://resolveops:resolveops@127.0.0.1:1/unreachable"),
+        ReadOnlyToolset(DatabaseTestBackend(), now=lambda: TEST_NOW),
+        InMemoryObjectStorage(),
+    )
+    application.dependency_overrides[require_principal] = lambda: principal
+
+    with TestClient(application) as client:
+        response = client.post(
+            f"/api/v1/runs/{uuid4()}/execute",
+            headers={"Idempotency-Key": str(uuid4())},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "workflow checkpoint persistence is unavailable"
 
 
 def test_artifact_metadata_must_match_the_active_run_and_kind() -> None:
@@ -383,6 +456,79 @@ def test_artifact_metadata_upsert_is_replay_safe(
         assert count_row[0] == 1
 
 
+def test_approval_proposal_replay_is_hash_stable_and_rejects_divergence(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    repository = DatabaseRunRepository(database_url)
+    created = repository.create_run(
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        case_id=seeded_case.case_id,
+        idempotency_key=uuid4(),
+    )
+    lease = repository.acquire_execution_lease(
+        run_id=created.run.run_id,
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        lease_seconds=60,
+    )
+    decision = PolicyDecision(
+        outcome=WorkflowOutcome.APPROVAL_REQUIRED,
+        risk_level=RiskLevel.R2,
+        reason_code="duplicate_charge_within_limit",
+        action_type=ActionType.APPLY_ACCOUNT_CREDIT,
+        target_reference=str(TEST_ACCOUNT_ID),
+        canonical_parameters={
+            "account_id": str(TEST_ACCOUNT_ID),
+            "amount_cents": 4_900,
+            "currency": "USD",
+        },
+        policy_key="billing_duplicate_credit",
+        policy_version="3.0",
+        approval_required=True,
+    )
+
+    first = repository.create_approval_gate_records(
+        lease=lease,
+        organization_id=seeded_case.principal.organization_id,
+        decision=decision,
+    )
+    reordered = repository.create_approval_gate_records(
+        lease=lease,
+        organization_id=seeded_case.principal.organization_id,
+        decision=decision.model_copy(
+            update={
+                "canonical_parameters": {
+                    "currency": "USD",
+                    "amount_cents": 4_900,
+                    "account_id": str(TEST_ACCOUNT_ID),
+                }
+            }
+        ),
+    )
+
+    assert reordered.proposal.proposal_id == first.proposal.proposal_id
+    assert reordered.proposal.proposal_hash == first.proposal.proposal_hash
+    assert reordered.proposal.idempotency_key == first.proposal.idempotency_key
+    assert reordered.approval_request.request_id == first.approval_request.request_id
+
+    with pytest.raises(ProposalReplayConflictError, match="replay differs"):
+        repository.create_approval_gate_records(
+            lease=lease,
+            organization_id=seeded_case.principal.organization_id,
+            decision=decision.model_copy(
+                update={
+                    "canonical_parameters": {
+                        "account_id": str(TEST_ACCOUNT_ID),
+                        "amount_cents": 4_800,
+                        "currency": "USD",
+                    }
+                }
+            ),
+        )
+
+
 def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
     database_url: str,
     seeded_case: SeededCase,
@@ -456,6 +602,148 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
     assert {artifact[0] for artifact in artifacts} == {"json_report", "markdown_brief"}
     assert all(str(artifact[1]).startswith(f"runs/{run_id}/report.") for artifact in artifacts)
     assert all(len(artifact[3]) == 64 and artifact[4] > 0 for artifact in artifacts)
+
+
+def test_approval_gate_persists_immutable_proposal_checkpoint_and_waiting_state(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    with _client(database_url, seeded_case.principal, ApprovalDatabaseTestBackend()) as client:
+        created, _ = _create_run(client, seeded_case.case_id)
+        run_id = created["run_id"]
+        execute_key = uuid4()
+        response = client.post(
+            f"/api/v1/runs/{run_id}/execute",
+            headers={
+                "Accept": "text/event-stream",
+                "Idempotency-Key": str(execute_key),
+            },
+        )
+        assert response.status_code == 200, response.text
+        run_response = client.get(f"/api/v1/runs/{run_id}")
+        replay = client.post(
+            f"/api/v1/runs/{run_id}/execute",
+            headers={"Idempotency-Key": str(execute_key)},
+        )
+
+    assert run_response.json()["status"] == "waiting_for_approval"
+    assert run_response.json()["current_node"] == "approval_gate"
+    assert replay.status_code == 200
+    assert replay.headers["Idempotent-Replay"] == "true"
+
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT id, action_type, target_reference, canonical_parameters,
+                   proposal_hash, risk_level, policy_key, policy_version,
+                   status, idempotency_key
+            FROM app.action_proposals
+            WHERE run_id = %s
+            """,
+            (run_id,),
+        )
+        proposal = cursor.fetchone()
+        assert proposal is not None
+        cursor.execute(
+            """
+            SELECT id, requested_by, decided_by, decision, comment, decided_at
+            FROM app.approval_requests
+            WHERE proposal_id = %s
+            """,
+            (proposal[0],),
+        )
+        approval = cursor.fetchone()
+        cursor.execute(
+            "SELECT count(*) FROM app.executed_actions WHERE proposal_id = %s", (proposal[0],)
+        )
+        executed_count = cursor.fetchone()
+        cursor.execute("SELECT count(*) FROM app.run_artifacts WHERE run_id = %s", (run_id,))
+        artifact_count = cursor.fetchone()
+        cursor.execute(
+            "SELECT to_regclass('langgraph.checkpoints'), to_regclass('public.checkpoints')"
+        )
+        checkpoint_tables = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT event_type, public_payload
+            FROM audit.workflow_events
+            WHERE run_id = %s
+            ORDER BY sequence
+            """,
+            (run_id,),
+        )
+        event_rows = cursor.fetchall()
+        event_types = [row[0] for row in event_rows]
+
+    assert proposal[1:4] == (
+        "apply_account_credit",
+        str(TEST_ACCOUNT_ID),
+        {"account_id": str(TEST_ACCOUNT_ID), "amount_cents": 4_900, "currency": "USD"},
+    )
+    expected_hash_payload = {
+        "action_type": proposal[1],
+        "target_reference": proposal[2],
+        "canonical_parameters": proposal[3],
+        "risk_level": proposal[5],
+        "policy_key": proposal[6],
+        "policy_version": proposal[7],
+    }
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            expected_hash_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+    ).hexdigest()
+    assert proposal[4] == expected_hash
+    assert proposal[5:9] == ("R2", "billing_duplicate_credit", "3.0", "pending_approval")
+    assert proposal[9] == f"resolveops:{run_id}:apply_account_credit:v1"
+    assert approval is not None
+    assert approval[1] == seeded_case.principal.user_id
+    assert approval[2:] == (None, None, None, None)
+    assert executed_count == (0,)
+    assert artifact_count == (0,)
+    assert checkpoint_tables == ("langgraph.checkpoints", None)
+    assert event_types[-1] == "approval.requested"
+    assert event_rows[-1][1]["approval_request_id"] == str(approval[0])
+    assert event_rows[-1][1]["proposal_id"] == str(proposal[0])
+    assert not {"run.completed", "run.escalated", "run.failed", "action.executed"}.intersection(
+        event_types
+    )
+    assert response.text.count("event: approval.requested") == 1
+    assert replay.text == response.text
+
+    async def reload_checkpoint() -> object:
+        async with open_async_postgres_saver(database_url) as saver:
+            checkpoint = await saver.aget_tuple({"configurable": {"thread_id": run_id}})
+            assert checkpoint is not None
+            policy = checkpoint.checkpoint["channel_values"]["policy_decision"]
+            assert isinstance(policy, PolicyDecision)
+            assert policy.outcome.value == "approval_required"
+            assert "branch:to:approval_gate" in checkpoint.checkpoint["channel_values"]
+            assert checkpoint.pending_writes is not None
+            interrupt_writes = [
+                value
+                for _, channel, value in checkpoint.pending_writes
+                if channel == "__interrupt__"
+            ]
+            assert len(interrupt_writes) == 1
+            assert interrupt_writes[0][0].value["proposal_id"] == str(proposal[0])
+            assert interrupt_writes[0][0].value["proposal_hash"] == proposal[4]
+            return checkpoint
+
+    assert asyncio.run(reload_checkpoint()) is not None
+
+    with (
+        pytest.raises(psycopg.errors.RaiseException, match="immutable action proposal fields"),
+        psycopg.connect(database_url) as connection,
+        connection.cursor() as cursor,
+    ):
+        cursor.execute(
+            "UPDATE app.action_proposals SET proposal_hash = %s WHERE id = %s",
+            ("0" * 64, proposal[0]),
+        )
 
 
 def test_active_execution_lease_rejects_a_concurrent_executor(

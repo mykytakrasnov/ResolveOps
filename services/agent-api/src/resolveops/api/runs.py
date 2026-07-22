@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
@@ -15,7 +16,10 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
-from resolveops.graph.duplicate_charge import execute_duplicate_charge_graph
+from resolveops.graph.duplicate_charge import (
+    execute_checkpointed_duplicate_charge_graph,
+    execute_duplicate_charge_graph,
+)
 from resolveops.models.contracts import (
     RunStatus,
     WorkflowEvent,
@@ -194,6 +198,12 @@ def execute_run(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="run artifact storage is unavailable",
         )
+    checkpoint_dsn = getattr(request.app.state, "checkpoint_dsn", None)
+    if not isinstance(checkpoint_dsn, str) or not checkpoint_dsn:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="workflow checkpoint persistence is unavailable",
+        )
 
     try:
         execution = repository.start_execution(
@@ -214,6 +224,7 @@ def execute_run(
                 lease=execution.lease,
                 read_tools=read_tools,
                 object_storage=object_storage,
+                checkpoint_dsn=checkpoint_dsn,
             )
             events = independent.events
             # Joining after the response body keeps the Lambda invocation alive even if
@@ -248,6 +259,7 @@ def _execute_shell(
     lease: ExecutionLease,
     read_tools: ReadOnlyToolset | None = None,
     object_storage: ObjectStorage | None = None,
+    checkpoint_dsn: str | None = None,
 ) -> Iterator[WorkflowEvent]:
     workflow_outcome: WorkflowOutcome | None = None
     outcome_reason_code: str | None = None
@@ -284,21 +296,47 @@ def _execute_shell(
             actor_user_id=principal.user_id,
             allow_all=principal.can_access_all_runs,
         )
-        graph_events = execute_duplicate_charge_graph(
-            tools=read_tools,
-            persistence=repository,
-            object_storage=object_storage,
-            lease=lease,
-            organization_id=principal.organization_id,
-            ticket=run_case.ticket,
-            case_created_at=run_case.created_at,
-        )
-        while True:
-            try:
-                yield next(graph_events)
-            except StopIteration as completed:
-                workflow_outcome, outcome_reason_code = completed.value
-                break
+        if checkpoint_dsn is None:
+            graph_events = execute_duplicate_charge_graph(
+                tools=read_tools,
+                persistence=repository,
+                object_storage=object_storage,
+                lease=lease,
+                organization_id=principal.organization_id,
+                ticket=run_case.ticket,
+                case_created_at=run_case.created_at,
+            )
+            while True:
+                try:
+                    yield next(graph_events)
+                except StopIteration as completed:
+                    workflow_outcome, outcome_reason_code = completed.value
+                    break
+        else:
+            checkpointed = asyncio.run(
+                execute_checkpointed_duplicate_charge_graph(
+                    tools=read_tools,
+                    persistence=repository,
+                    object_storage=object_storage,
+                    lease=lease,
+                    organization_id=principal.organization_id,
+                    ticket=run_case.ticket,
+                    case_created_at=run_case.created_at,
+                    checkpoint_dsn=checkpoint_dsn,
+                )
+            )
+            yield from checkpointed.events
+            workflow_outcome = checkpointed.workflow_outcome
+            outcome_reason_code = checkpointed.outcome_reason_code
+            if workflow_outcome is WorkflowOutcome.APPROVAL_REQUIRED:
+                if checkpointed.approval_records is None:
+                    raise RuntimeError("approval interrupt did not return persisted records")
+                yield repository.mark_waiting_for_approval(
+                    lease=lease,
+                    organization_id=principal.organization_id,
+                    records=checkpointed.approval_records,
+                )
+                return
     if workflow_outcome is WorkflowOutcome.ESCALATE:
         yield repository.append_event(
             lease=lease,
@@ -314,20 +352,7 @@ def _execute_shell(
         )
         return
     if workflow_outcome is WorkflowOutcome.APPROVAL_REQUIRED:
-        yield repository.append_event(
-            lease=lease,
-            organization_id=principal.organization_id,
-            event_type=WorkflowEventType.RUN_FAILED,
-            status="failed",
-            public_payload={
-                "error_code": "approval_flow_not_implemented",
-                "recoverable": True,
-                "workflow_outcome": WorkflowOutcome.APPROVAL_REQUIRED.value,
-            },
-            final_status=RunStatus.FAILED,
-            final_error_code="approval_flow_not_implemented",
-        )
-        return
+        raise RuntimeError("approval-required execution needs durable checkpoint persistence")
     yield repository.append_event(
         lease=lease,
         organization_id=principal.organization_id,
@@ -351,6 +376,7 @@ def _start_independent_execution(
     lease: ExecutionLease,
     read_tools: ReadOnlyToolset | None = None,
     object_storage: ObjectStorage | None = None,
+    checkpoint_dsn: str | None = None,
 ) -> IndependentExecution:
     """Run persistence independently so a disconnected stream cannot cancel the run."""
 
@@ -364,6 +390,7 @@ def _start_independent_execution(
                 lease=lease,
                 read_tools=read_tools,
                 object_storage=object_storage,
+                checkpoint_dsn=checkpoint_dsn,
             ):
                 messages.put(event)
         except Exception as error:  # noqa: BLE001 - persist a safe terminal failure
@@ -412,7 +439,12 @@ def _replay_execution(
     run_id: UUID,
 ) -> Iterator[str]:
     after_sequence = 0
-    terminal_statuses = {RunStatus.COMPLETED, RunStatus.ESCALATED, RunStatus.FAILED}
+    terminal_statuses = {
+        RunStatus.WAITING_FOR_APPROVAL,
+        RunStatus.COMPLETED,
+        RunStatus.ESCALATED,
+        RunStatus.FAILED,
+    }
     deadline = monotonic() + REPLAY_WAIT_SECONDS
     while monotonic() < deadline:
         events = repository.list_events(
