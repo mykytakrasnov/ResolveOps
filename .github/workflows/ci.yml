@@ -52,10 +52,12 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --directory services/agent-api --frozen
       - name: Check formatting
-        run: uv run --directory services/agent-api ruff format --check src tests
+        run: uv run --directory services/agent-api ruff format --check src tests migrations
       - name: Lint
-        run: uv run --directory services/agent-api ruff check src tests
+        run: uv run --directory services/agent-api ruff check src tests migrations
       - name: Typecheck
         run: uv run --directory services/agent-api mypy src tests
+      - name: Check generated contracts
+        run: PYTHONPATH="$PWD/services/agent-api/src" uv run --project services/agent-api python -m resolveops.models.contract_generation --check --repository-root "$PWD"
       - name: Test
         run: uv run --directory services/agent-api pytest

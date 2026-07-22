@@ -6,7 +6,12 @@
     "useIgnoreFile": true
   },
   "files": {
-    "ignoreUnknown": true
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!packages/contracts/generated",
+      "!packages/contracts/openapi.json"
+    ]
   },
   "formatter": {
     "enabled": true,

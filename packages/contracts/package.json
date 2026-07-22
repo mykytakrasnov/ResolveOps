@@ -2,6 +2,11 @@
   "name": "@resolveops/contracts",
   "version": "0.0.0",
   "private": true,
+  "types": "./generated/index.ts",
+  "exports": {
+    ".": "./generated/index.ts",
+    "./openapi.json": "./openapi.json"
+  },
   "scripts": {
     "typecheck": "tsc --project tsconfig.json"
   }

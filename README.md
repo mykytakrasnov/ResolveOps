@@ -5,8 +5,9 @@ will investigate a bounded case, assemble cited evidence, apply deterministic po
 human approval before consequential synthetic actions, and resume safely from a durable
 checkpoint. It is deliberately not a general-purpose chatbot.
 
-This repository currently contains the foundation monorepo only. The bootstrap checks run
-without cloud credentials, Docker, or external services.
+The repository includes shared workflow contracts, the initial PostgreSQL migrations, and
+optional local PostgreSQL and MinIO services. The ordinary bootstrap checks still run without
+cloud credentials, Docker, or external services.
 
 ## Prerequisites
 
@@ -15,6 +16,7 @@ without cloud credentials, Docker, or external services.
 - Python `3.12.3` (pinned in `.python-version`)
 - uv `0.11.31`
 - GNU Make
+- Docker with Compose (only for local PostgreSQL and MinIO)
 
 ## Bootstrap locally
 
@@ -37,7 +39,43 @@ make format-check  # verify formatting without changing files
 make lint          # run Biome and Ruff
 make typecheck     # run TypeScript and mypy
 make test          # run the Python test suite
+make contracts-generate # regenerate OpenAPI and TypeScript contracts
+make contracts-check    # fail when generated contracts have drifted
 ```
+
+## Shared contracts
+
+Pydantic v2 is the source of truth in
+`services/agent-api/src/resolveops/models/contracts.py`. It defines the bounded workflow inputs
+and outputs, frontend-safe case/run/event/proposal/approval/artifact records, and the generic
+typed tool envelope. Unknown input fields are rejected, tool names and event types are
+allowlisted, and reviewer decisions are bound to a proposal hash.
+
+Run `make contracts-generate` after changing a contract. It deterministically updates:
+
+- `packages/contracts/openapi.json`, an OpenAPI 3.1 components document
+- `packages/contracts/generated/index.ts`, strict TypeScript declarations
+
+`make contracts-check`, the Python test suite, and CI all detect generated-contract drift.
+
+## Local PostgreSQL and MinIO
+
+Copy `.env.example` to `.env` only when you need to override local defaults. The checked-in
+defaults are synthetic development credentials and must not be reused outside local development.
+
+```bash
+make infra-up       # PostgreSQL 16, private MinIO bucket, and MinIO console
+make migrate        # upgrade PostgreSQL with DATABASE_URL_DIRECT
+make infra-down     # stop services; named volumes retain local data
+```
+
+PostgreSQL listens on `localhost:5432`. MinIO's S3 endpoint listens on `localhost:9000`, and its
+console listens on `localhost:9001`. The initialization container creates the private
+`resolveops-local` bucket. Override ports, credentials, bucket, and connection strings with the
+variables documented in `.env.example`.
+
+`make migration-sql` renders the complete PostgreSQL upgrade offline and does not contact a
+database. This is also how the unit suite validates migration startup without credentials.
 
 ## Repository layout
 
@@ -52,8 +90,8 @@ scripts/              Repository automation
 docs/                 Product, architecture, reliability, and security documentation
 ```
 
-The empty package areas are intentional scaffolding. Contracts, migrations, datasets, synthetic
-APIs, and workflow execution will be introduced in their dedicated follow-up issues.
+Dataset generation, synthetic system routes, and workflow run creation/execution remain
+intentional scaffolding for their dedicated follow-up issues.
 
 ## First tracer-bullet goal
 

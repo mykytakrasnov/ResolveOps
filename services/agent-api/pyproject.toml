@@ -3,7 +3,12 @@ name = "resolveops-agent-api"
 version = "0.0.0"
 description = "ResolveOps agent API package boundary"
 requires-python = "==3.12.*"
-dependencies = []
+dependencies = [
+    "alembic==1.18.4",
+    "psycopg[binary]==3.3.2",
+    "pydantic==2.12.5",
+    "sqlalchemy==2.0.46",
+]
 
 [dependency-groups]
 dev = [

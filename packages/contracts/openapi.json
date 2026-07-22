@@ -1,0 +1,1372 @@
+{
+  "components": {
+    "schemas": {
+      "ActionExecutionStatus": {
+        "enum": [
+          "succeeded",
+          "failed",
+          "ambiguous"
+        ],
+        "title": "ActionExecutionStatus",
+        "type": "string"
+      },
+      "ActionProposal": {
+        "additionalProperties": false,
+        "description": "Immutable, policy-enforced action proposal shown to a reviewer.",
+        "properties": {
+          "action_type": {
+            "$ref": "#/components/schemas/ActionType"
+          },
+          "canonical_parameters": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Canonical Parameters",
+            "type": "object"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "policy_key": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Policy Key",
+            "type": "string"
+          },
+          "policy_version": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "proposal_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Proposal Hash",
+            "type": "string"
+          },
+          "proposal_id": {
+            "format": "uuid",
+            "title": "Proposal Id",
+            "type": "string"
+          },
+          "risk_level": {
+            "$ref": "#/components/schemas/RiskLevel"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProposalStatus"
+          },
+          "target_reference": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Target Reference",
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "run_id",
+          "action_type",
+          "target_reference",
+          "canonical_parameters",
+          "proposal_hash",
+          "risk_level",
+          "policy_key",
+          "policy_version",
+          "status",
+          "idempotency_key",
+          "created_at"
+        ],
+        "title": "ActionProposal",
+        "type": "object"
+      },
+      "ActionProposalInput": {
+        "additionalProperties": false,
+        "description": "Untrusted model recommendation awaiting deterministic policy enforcement.",
+        "properties": {
+          "action_type": {
+            "$ref": "#/components/schemas/ActionType"
+          },
+          "cited_evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Cited Evidence Ids",
+            "type": "array"
+          },
+          "parameters": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Parameters",
+            "type": "object"
+          },
+          "rationale": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "target_reference": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Target Reference",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_type",
+          "target_reference",
+          "parameters",
+          "rationale",
+          "cited_evidence_ids"
+        ],
+        "title": "ActionProposalInput",
+        "type": "object"
+      },
+      "ActionResult": {
+        "additionalProperties": false,
+        "description": "Result of deterministic exactly-once synthetic action execution.",
+        "properties": {
+          "executed_at": {
+            "format": "date-time",
+            "title": "Executed At",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "proposal_id": {
+            "format": "uuid",
+            "title": "Proposal Id",
+            "type": "string"
+          },
+          "result": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Result",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ActionExecutionStatus"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "idempotency_key",
+          "status",
+          "executed_at"
+        ],
+        "title": "ActionResult",
+        "type": "object"
+      },
+      "ActionType": {
+        "enum": [
+          "create_internal_case_note",
+          "apply_account_credit",
+          "change_case_status",
+          "escalate_case"
+        ],
+        "title": "ActionType",
+        "type": "string"
+      },
+      "ApprovalDecision": {
+        "additionalProperties": false,
+        "description": "Persisted human decision bound to an exact proposal hash.",
+        "properties": {
+          "comment": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Comment"
+          },
+          "decided_at": {
+            "format": "date-time",
+            "title": "Decided At",
+            "type": "string"
+          },
+          "decided_by": {
+            "format": "uuid",
+            "title": "Decided By",
+            "type": "string"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecisionType"
+          },
+          "proposal_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Proposal Hash",
+            "type": "string"
+          },
+          "proposal_id": {
+            "format": "uuid",
+            "title": "Proposal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "proposal_hash",
+          "decision",
+          "decided_by",
+          "decided_at"
+        ],
+        "title": "ApprovalDecision",
+        "type": "object"
+      },
+      "ApprovalDecisionType": {
+        "enum": [
+          "approve",
+          "reject"
+        ],
+        "title": "ApprovalDecisionType",
+        "type": "string"
+      },
+      "ApprovalRequest": {
+        "additionalProperties": false,
+        "description": "Reviewer-facing approval state for a persisted proposal.",
+        "properties": {
+          "decision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalDecision"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "proposal": {
+            "$ref": "#/components/schemas/ActionProposal"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "requested_by": {
+            "format": "uuid",
+            "title": "Requested By",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "proposal",
+          "requested_by",
+          "requested_at"
+        ],
+        "title": "ApprovalRequest",
+        "type": "object"
+      },
+      "ArtifactKind": {
+        "enum": [
+          "json_report",
+          "markdown_brief",
+          "customer_response",
+          "public_events"
+        ],
+        "title": "ArtifactKind",
+        "type": "string"
+      },
+      "AttachmentMetadata": {
+        "additionalProperties": false,
+        "description": "Metadata for a private, previously authorized attachment.",
+        "properties": {
+          "filename": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Filename",
+            "type": "string"
+          },
+          "mime_type": {
+            "maxLength": 127,
+            "minLength": 1,
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "object_key": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Object Key",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 5242880,
+            "minimum": 0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "object_key",
+          "filename",
+          "mime_type",
+          "size_bytes",
+          "sha256"
+        ],
+        "title": "AttachmentMetadata",
+        "type": "object"
+      },
+      "CaseCategory": {
+        "enum": [
+          "duplicate_charge",
+          "billing",
+          "access",
+          "incident",
+          "product_issue",
+          "plan_limit",
+          "unknown"
+        ],
+        "title": "CaseCategory",
+        "type": "string"
+      },
+      "CaseClassification": {
+        "additionalProperties": false,
+        "description": "Validated structured output from case classification.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/CaseCategory"
+          },
+          "confidence": {
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "requested_outcome": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Requested Outcome",
+            "type": "string"
+          },
+          "risk_indicators": {
+            "items": {
+              "$ref": "#/components/schemas/RiskIndicator"
+            },
+            "title": "Risk Indicators",
+            "type": "array"
+          },
+          "suspected_account_reference": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Suspected Account Reference"
+          },
+          "urgency": {
+            "$ref": "#/components/schemas/Urgency"
+          }
+        },
+        "required": [
+          "category",
+          "urgency",
+          "confidence",
+          "requested_outcome"
+        ],
+        "title": "CaseClassification",
+        "type": "object"
+      },
+      "CaseStatus": {
+        "enum": [
+          "open",
+          "investigating",
+          "waiting_for_approval",
+          "resolved",
+          "escalated"
+        ],
+        "title": "CaseStatus",
+        "type": "string"
+      },
+      "EvidenceBundle": {
+        "additionalProperties": false,
+        "description": "Verified evidence and deterministic completeness metadata.",
+        "properties": {
+          "completeness_score": {
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Completeness Score",
+            "type": "number"
+          },
+          "contradictions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Contradictions",
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvidenceItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items",
+          "completeness_score"
+        ],
+        "title": "EvidenceBundle",
+        "type": "object"
+      },
+      "EvidenceItem": {
+        "additionalProperties": false,
+        "description": "A single factual observation returned by an allowlisted source.",
+        "properties": {
+          "evidence_id": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "fact": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Fact",
+            "type": "string"
+          },
+          "integrity_hash": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Integrity Hash"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "source_object_id": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Source Object Id",
+            "type": "string"
+          },
+          "source_object_type": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Source Object Type",
+            "type": "string"
+          },
+          "source_system": {
+            "$ref": "#/components/schemas/SourceSystem"
+          },
+          "structured_fields": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Structured Fields",
+            "type": "object"
+          }
+        },
+        "required": [
+          "evidence_id",
+          "source_system",
+          "source_object_type",
+          "source_object_id",
+          "observed_at",
+          "fact"
+        ],
+        "title": "EvidenceItem",
+        "type": "object"
+      },
+      "FinalResponse": {
+        "additionalProperties": false,
+        "description": "Validated customer draft and internal note without hidden reasoning.",
+        "properties": {
+          "body": {
+            "maxLength": 10000,
+            "minLength": 1,
+            "title": "Body",
+            "type": "string"
+          },
+          "cited_evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Cited Evidence Ids",
+            "type": "array"
+          },
+          "internal_case_note": {
+            "maxLength": 10000,
+            "minLength": 1,
+            "title": "Internal Case Note",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          },
+          "uncertainty_disclosure": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Uncertainty Disclosure"
+          }
+        },
+        "required": [
+          "subject",
+          "body",
+          "internal_case_note",
+          "cited_evidence_ids"
+        ],
+        "title": "FinalResponse",
+        "type": "object"
+      },
+      "InvestigationPlan": {
+        "additionalProperties": false,
+        "description": "Deterministically selected allowlisted evidence recipe.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/CaseCategory"
+          },
+          "max_additional_rounds": {
+            "default": 1,
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Max Additional Rounds",
+            "type": "integer"
+          },
+          "optional_tools": {
+            "items": {
+              "$ref": "#/components/schemas/ReadToolName"
+            },
+            "title": "Optional Tools",
+            "type": "array"
+          },
+          "recipe_id": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Recipe Id",
+            "type": "string"
+          },
+          "required_tools": {
+            "items": {
+              "$ref": "#/components/schemas/ReadToolName"
+            },
+            "minItems": 1,
+            "title": "Required Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "recipe_id",
+          "category",
+          "required_tools"
+        ],
+        "title": "InvestigationPlan",
+        "type": "object"
+      },
+      "JsonValue": {},
+      "ProposalStatus": {
+        "enum": [
+          "pending_approval",
+          "approved",
+          "rejected",
+          "blocked",
+          "executed",
+          "invalidated"
+        ],
+        "title": "ProposalStatus",
+        "type": "string"
+      },
+      "ReadToolName": {
+        "description": "Tools the model may request during bounded evidence collection.",
+        "enum": [
+          "lookup_customer",
+          "get_subscription",
+          "list_invoices",
+          "get_payment_attempts",
+          "get_product_events",
+          "list_service_incidents",
+          "search_knowledge_base",
+          "get_policy",
+          "get_case_history"
+        ],
+        "title": "ReadToolName",
+        "type": "string"
+      },
+      "RequestedToolCall": {
+        "additionalProperties": false,
+        "description": "A bounded request for one additional evidence lookup.",
+        "properties": {
+          "arguments": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Arguments",
+            "type": "object"
+          },
+          "missing_fact": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Missing Fact",
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "tool": {
+            "$ref": "#/components/schemas/ReadToolName"
+          }
+        },
+        "required": [
+          "missing_fact",
+          "tool",
+          "arguments",
+          "reason"
+        ],
+        "title": "RequestedToolCall",
+        "type": "object"
+      },
+      "ResolutionProposal": {
+        "additionalProperties": false,
+        "description": "Evidence-cited model recommendation, not an authorization to act.",
+        "properties": {
+          "action_proposal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ActionProposalInput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "cited_evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Cited Evidence Ids",
+            "type": "array"
+          },
+          "explanation": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Explanation",
+            "type": "string"
+          },
+          "missing_data": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing Data",
+            "type": "array"
+          },
+          "recommended_next_step": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Recommended Next Step",
+            "type": "string"
+          },
+          "resolution_code": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Resolution Code",
+            "type": "string"
+          },
+          "uncertain": {
+            "default": false,
+            "title": "Uncertain",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "resolution_code",
+          "explanation",
+          "cited_evidence_ids",
+          "recommended_next_step"
+        ],
+        "title": "ResolutionProposal",
+        "type": "object"
+      },
+      "RiskIndicator": {
+        "enum": [
+          "prompt_injection",
+          "unsupported_action",
+          "identity_or_security",
+          "legal_or_privacy",
+          "conflicting_data"
+        ],
+        "title": "RiskIndicator",
+        "type": "string"
+      },
+      "RiskLevel": {
+        "enum": [
+          "R0",
+          "R1",
+          "R2",
+          "R3",
+          "R4"
+        ],
+        "title": "RiskLevel",
+        "type": "string"
+      },
+      "RunArtifact": {
+        "additionalProperties": false,
+        "description": "Reference to a private report object; no storage credentials are exposed.",
+        "properties": {
+          "artifact_id": {
+            "format": "uuid",
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ArtifactKind"
+          },
+          "mime_type": {
+            "maxLength": 127,
+            "minLength": 1,
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "object_key": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Object Key",
+            "type": "string"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "run_id",
+          "kind",
+          "object_key",
+          "mime_type",
+          "sha256",
+          "size_bytes",
+          "created_at"
+        ],
+        "title": "RunArtifact",
+        "type": "object"
+      },
+      "RunError": {
+        "additionalProperties": false,
+        "description": "Safe terminal or recoverable workflow error.",
+        "properties": {
+          "code": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "node_name": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Node Name"
+          },
+          "recoverable": {
+            "title": "Recoverable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ],
+        "title": "RunError",
+        "type": "object"
+      },
+      "RunStatus": {
+        "enum": [
+          "created",
+          "running",
+          "waiting_for_approval",
+          "completed",
+          "escalated",
+          "failed"
+        ],
+        "title": "RunStatus",
+        "type": "string"
+      },
+      "SourceSystem": {
+        "description": "Allowlisted systems that may contribute workflow evidence.",
+        "enum": [
+          "crm",
+          "billing",
+          "telemetry",
+          "incidents",
+          "knowledge_base",
+          "policy",
+          "case_history",
+          "calculation",
+          "synthetic_actions"
+        ],
+        "title": "SourceSystem",
+        "type": "string"
+      },
+      "SupportCase": {
+        "additionalProperties": false,
+        "description": "Frontend-safe synthetic support case shape.",
+        "properties": {
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/AttachmentMetadata"
+            },
+            "maxItems": 3,
+            "title": "Attachments",
+            "type": "array"
+          },
+          "body": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Body",
+            "type": "string"
+          },
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "uuid",
+            "title": "Created By",
+            "type": "string"
+          },
+          "customer_reference": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Customer Reference",
+            "type": "string"
+          },
+          "dataset_case_id": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Dataset Case Id"
+          },
+          "organization_id": {
+            "format": "uuid",
+            "title": "Organization Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CaseStatus"
+          },
+          "subject": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_id",
+          "organization_id",
+          "subject",
+          "body",
+          "customer_reference",
+          "status",
+          "created_by",
+          "created_at"
+        ],
+        "title": "SupportCase",
+        "type": "object"
+      },
+      "TicketInput": {
+        "additionalProperties": false,
+        "description": "Normalized synthetic support ticket supplied to a workflow run.",
+        "properties": {
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/AttachmentMetadata"
+            },
+            "maxItems": 3,
+            "title": "Attachments",
+            "type": "array"
+          },
+          "body": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Body",
+            "type": "string"
+          },
+          "customer_reference": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Customer Reference",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "body",
+          "customer_reference"
+        ],
+        "title": "TicketInput",
+        "type": "object"
+      },
+      "ToolResult": {
+        "additionalProperties": false,
+        "description": "Standard envelope returned by every typed tool adapter.",
+        "properties": {
+          "attempt": {
+            "minimum": 1,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "data": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Data"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Code"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Message"
+          },
+          "latency_ms": {
+            "minimum": 0,
+            "title": "Latency Ms",
+            "type": "integer"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "source_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Ids",
+            "type": "array"
+          },
+          "source_system": {
+            "$ref": "#/components/schemas/SourceSystem"
+          }
+        },
+        "required": [
+          "ok",
+          "source_system",
+          "observed_at",
+          "latency_ms",
+          "attempt"
+        ],
+        "title": "ToolResult",
+        "type": "object"
+      },
+      "Urgency": {
+        "enum": [
+          "low",
+          "normal",
+          "high",
+          "critical"
+        ],
+        "title": "Urgency",
+        "type": "string"
+      },
+      "WorkflowEvent": {
+        "additionalProperties": false,
+        "description": "Append-only event payload safe to expose to the product UI.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "event_id": {
+            "minimum": 1,
+            "title": "Event Id",
+            "type": "integer"
+          },
+          "event_type": {
+            "$ref": "#/components/schemas/WorkflowEventType"
+          },
+          "node_name": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Node Name"
+          },
+          "payload_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Payload Hash",
+            "type": "string"
+          },
+          "public_payload": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "title": "Public Payload",
+            "type": "object"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "sequence": {
+            "minimum": 1,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "status": {
+            "maxLength": 50,
+            "minLength": 1,
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "run_id",
+          "sequence",
+          "event_type",
+          "status",
+          "payload_hash",
+          "created_at"
+        ],
+        "title": "WorkflowEvent",
+        "type": "object"
+      },
+      "WorkflowEventType": {
+        "enum": [
+          "run.started",
+          "node.started",
+          "node.completed",
+          "tool.started",
+          "tool.completed",
+          "tool.failed",
+          "model.retry",
+          "model.fallback",
+          "evidence.added",
+          "approval.requested",
+          "approval.decided",
+          "action.executed",
+          "run.escalated",
+          "run.completed",
+          "run.failed"
+        ],
+        "title": "WorkflowEventType",
+        "type": "string"
+      },
+      "WorkflowRun": {
+        "additionalProperties": false,
+        "description": "Public workflow run state without checkpoint or hidden reasoning data.",
+        "properties": {
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Completed At"
+          },
+          "cost_usd": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Cost Usd",
+            "type": "number"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "current_node": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Current Node"
+          },
+          "dataset_version": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Dataset Version"
+          },
+          "execution_attempt": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Execution Attempt",
+            "type": "integer"
+          },
+          "graph_version": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Graph Version",
+            "type": "string"
+          },
+          "initiated_by": {
+            "format": "uuid",
+            "title": "Initiated By",
+            "type": "string"
+          },
+          "input_tokens": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "organization_id": {
+            "format": "uuid",
+            "title": "Organization Id",
+            "type": "string"
+          },
+          "output_tokens": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "prompt_bundle_version": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Prompt Bundle Version",
+            "type": "string"
+          },
+          "resolved_model": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Resolved Model"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Started At"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStatus"
+          },
+          "thread_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Thread Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "organization_id",
+          "case_id",
+          "thread_id",
+          "initiated_by",
+          "status",
+          "graph_version",
+          "prompt_bundle_version",
+          "created_at"
+        ],
+        "title": "WorkflowRun",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Generated from Pydantic v2 models; do not edit by hand.",
+    "title": "ResolveOps shared contracts",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {}
+}
