@@ -1,0 +1,23 @@
+.codegraph/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Python
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Generated local data is intentionally not versioned.
+data/generated/*
+!data/generated/.gitkeep

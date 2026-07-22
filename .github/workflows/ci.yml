@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: Node checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Enable pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.0.7 --activate
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check formatting
+        run: pnpm format:check
+      - name: Lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+
+  python:
+    name: Python checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.31"
+          enable-cache: true
+          cache-dependency-glob: services/agent-api/uv.lock
+      - name: Install Python dependencies
+        run: uv sync --directory services/agent-api --frozen
+      - name: Check formatting
+        run: uv run --directory services/agent-api ruff format --check src tests
+      - name: Lint
+        run: uv run --directory services/agent-api ruff check src tests
+      - name: Typecheck
+        run: uv run --directory services/agent-api mypy src tests
+      - name: Test
+        run: uv run --directory services/agent-api pytest
