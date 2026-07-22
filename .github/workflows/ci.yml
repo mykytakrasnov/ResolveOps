@@ -38,6 +38,22 @@ jobs:
   python:
     name: Python checks
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.10-alpine
+        env:
+          POSTGRES_DB: resolveops_test
+          POSTGRES_USER: resolveops
+          POSTGRES_PASSWORD: resolveops
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U resolveops -d resolveops_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL_TEST: postgresql://resolveops:resolveops@localhost:5432/resolveops_test
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
