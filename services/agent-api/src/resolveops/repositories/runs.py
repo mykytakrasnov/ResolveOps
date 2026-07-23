@@ -37,7 +37,9 @@ from resolveops.models.contracts import (
     WorkflowEventType,
     WorkflowRun,
 )
+from resolveops.models.gateway import ModelCallMetadata
 from resolveops.models.run_api import ApprovalEvidence, ApprovalQueueItem
+from resolveops.prompts import PROMPT_BUNDLE_VERSION
 from resolveops.storage.artifacts import StoredObject
 from resolveops.tools.account_credit import (
     AccountCreditInput,
@@ -47,7 +49,6 @@ from resolveops.tools.account_credit import (
 )
 
 GRAPH_VERSION = "1.0.0"
-PROMPT_BUNDLE_VERSION = "1.0.0"
 DATASET_VERSION = "v1"
 IDEMPOTENCY_TTL_HOURS = 24
 EVENT_PAGE_SIZE = 500
@@ -1606,6 +1607,68 @@ class DatabaseRunRepository:
             )
             if cursor.rowcount != 1:
                 raise RunRepositoryError("tool attempt was not available for completion")
+
+    def record_model_call(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        call: ModelCallMetadata,
+    ) -> None:
+        """Persist compact provider metadata without prompts, outputs, or reasoning."""
+
+        if call.run_id != lease.run_id:
+            raise RunRepositoryError("model call run does not match the execution lease")
+        with self._connect() as connection, connection.cursor() as cursor:
+            self._lock_owned_lease(cursor, lease=lease, organization_id=organization_id)
+            cursor.execute(
+                """
+                INSERT INTO app.model_calls (
+                    id, run_id, node_name, provider, requested_model, resolved_model,
+                    prompt_name, prompt_version, generation_id, input_tokens, output_tokens,
+                    reasoning_tokens, cost_usd, latency_ms, status, error_code
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    uuid4(),
+                    lease.run_id,
+                    call.node_name,
+                    call.provider,
+                    call.requested_model,
+                    call.resolved_model,
+                    call.prompt_name,
+                    call.prompt_version,
+                    call.generation_id,
+                    call.input_tokens,
+                    call.output_tokens,
+                    call.reasoning_tokens,
+                    call.cost_usd,
+                    call.latency_ms,
+                    call.status,
+                    call.error_code.value if call.error_code is not None else None,
+                ),
+            )
+            if call.status == "completed":
+                cursor.execute(
+                    """
+                    UPDATE app.workflow_runs
+                    SET resolved_model = COALESCE(%s, resolved_model),
+                        input_tokens = input_tokens + %s,
+                        output_tokens = output_tokens + %s,
+                        cost_usd = cost_usd + %s
+                    WHERE id = %s AND organization_id = %s
+                    """,
+                    (
+                        call.resolved_model,
+                        call.input_tokens,
+                        call.output_tokens,
+                        call.cost_usd,
+                        lease.run_id,
+                        organization_id,
+                    ),
+                )
 
     @staticmethod
     def _lock_owned_lease(

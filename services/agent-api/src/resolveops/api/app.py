@@ -10,6 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from resolveops.api.runs import router as runs_router
+from resolveops.models.gateway import ModelGateway, OpenRouterModelGateway
 from resolveops.repositories.runs import DatabaseRunRepository
 from resolveops.storage.artifacts import LocalObjectStorage, ObjectStorage
 from resolveops.tools.read_only import ReadOnlyToolset
@@ -21,6 +22,7 @@ def create_app(
     read_tools: ReadOnlyToolset | None = None,
     object_storage: ObjectStorage | None = None,
     checkpoint_dsn: str | None = None,
+    model_gateway: ModelGateway | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -55,6 +57,12 @@ def create_app(
         )
         if configured_checkpoint_dsn:
             application.state.checkpoint_dsn = configured_checkpoint_dsn
+        if model_gateway is not None:
+            application.state.model_gateway = model_gateway
+        else:
+            openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+            if openrouter_api_key:
+                application.state.model_gateway = OpenRouterModelGateway(api_key=openrouter_api_key)
         yield
 
     application = FastAPI(title="ResolveOps Agent API", version="0.0.0", lifespan=lifespan)

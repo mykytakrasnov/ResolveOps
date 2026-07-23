@@ -29,6 +29,7 @@ from resolveops.models.contracts import (
     WorkflowOutcome,
     WorkflowRun,
 )
+from resolveops.models.gateway import ModelGateway
 from resolveops.models.run_api import (
     ApprovalDecisionRequest,
     ApprovalDecisionResponse,
@@ -53,8 +54,8 @@ from resolveops.repositories.runs import (
 from resolveops.storage.artifacts import ObjectStorage
 from resolveops.tools.read_only import ReadOnlyToolset
 
-LEASE_SECONDS = 60
-REPLAY_WAIT_SECONDS = LEASE_SECONDS + 1
+LEASE_SECONDS = 180
+REPLAY_WAIT_SECONDS = 61
 REPLAY_POLL_SECONDS = 1.0
 RUN_SHELL_NODE = "initialize_run_shell"
 
@@ -236,6 +237,7 @@ def decide_run(
     read_tools = getattr(request.app.state, "read_tools", None)
     object_storage = getattr(request.app.state, "object_storage", None)
     checkpoint_dsn = getattr(request.app.state, "checkpoint_dsn", None)
+    model_gateway = getattr(request.app.state, "model_gateway", None)
     if not isinstance(read_tools, ReadOnlyToolset):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -272,6 +274,7 @@ def decide_run(
                 read_tools=read_tools,
                 object_storage=object_storage,
                 checkpoint_dsn=checkpoint_dsn,
+                model_gateway=model_gateway if isinstance(model_gateway, ModelGateway) else None,
             )
     except RunNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
@@ -321,6 +324,7 @@ def _resume_decided_run(
     read_tools: ReadOnlyToolset,
     object_storage: ObjectStorage,
     checkpoint_dsn: str,
+    model_gateway: ModelGateway | None = None,
 ) -> None:
     try:
         existing_events = repository.list_events(
@@ -355,6 +359,7 @@ def _resume_decided_run(
                 organization_id=principal.organization_id,
                 decision=body.decision,
                 checkpoint_dsn=checkpoint_dsn,
+                model_gateway=model_gateway,
             )
         )
         if body.decision is ApprovalDecisionType.APPROVE:
@@ -440,6 +445,7 @@ def execute_run(
             detail="run artifact storage is unavailable",
         )
     checkpoint_dsn = getattr(request.app.state, "checkpoint_dsn", None)
+    model_gateway = getattr(request.app.state, "model_gateway", None)
     if not isinstance(checkpoint_dsn, str) or not checkpoint_dsn:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -466,6 +472,7 @@ def execute_run(
                 read_tools=read_tools,
                 object_storage=object_storage,
                 checkpoint_dsn=checkpoint_dsn,
+                model_gateway=model_gateway if isinstance(model_gateway, ModelGateway) else None,
             )
             events = independent.events
             # Joining after the response body keeps the Lambda invocation alive even if
@@ -501,6 +508,7 @@ def _execute_shell(
     read_tools: ReadOnlyToolset | None = None,
     object_storage: ObjectStorage | None = None,
     checkpoint_dsn: str | None = None,
+    model_gateway: ModelGateway | None = None,
 ) -> Iterator[WorkflowEvent]:
     workflow_outcome: WorkflowOutcome | None = None
     outcome_reason_code: str | None = None
@@ -546,6 +554,7 @@ def _execute_shell(
                 organization_id=principal.organization_id,
                 ticket=run_case.ticket,
                 case_created_at=run_case.created_at,
+                model_gateway=model_gateway,
             )
             while True:
                 try:
@@ -564,6 +573,7 @@ def _execute_shell(
                     ticket=run_case.ticket,
                     case_created_at=run_case.created_at,
                     checkpoint_dsn=checkpoint_dsn,
+                    model_gateway=model_gateway,
                 )
             )
             yield from checkpointed.events
@@ -618,6 +628,7 @@ def _start_independent_execution(
     read_tools: ReadOnlyToolset | None = None,
     object_storage: ObjectStorage | None = None,
     checkpoint_dsn: str | None = None,
+    model_gateway: ModelGateway | None = None,
 ) -> IndependentExecution:
     """Run persistence independently so a disconnected stream cannot cancel the run."""
 
@@ -632,6 +643,7 @@ def _start_independent_execution(
                 read_tools=read_tools,
                 object_storage=object_storage,
                 checkpoint_dsn=checkpoint_dsn,
+                model_gateway=model_gateway,
             ):
                 messages.put(event)
         except Exception as error:  # noqa: BLE001 - persist a safe terminal failure

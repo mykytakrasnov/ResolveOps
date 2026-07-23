@@ -201,6 +201,22 @@ class RequestedToolCall(ContractModel):
     reason: str = Field(min_length=1, max_length=1_000)
 
 
+class EvidenceGapAssessment(ContractModel):
+    """Validated model assessment; deterministic code still owns tool execution."""
+
+    sufficient: bool
+    requested_tools: list[RequestedToolCall] = Field(default_factory=list, max_length=4)
+    missing_data: list[str] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def sufficient_assessment_has_no_requests(self) -> "EvidenceGapAssessment":
+        if self.sufficient and (self.requested_tools or self.missing_data):
+            raise ValueError("sufficient evidence cannot contain gap requests")
+        if not self.sufficient and not (self.requested_tools or self.missing_data):
+            raise ValueError("insufficient evidence must identify a gap")
+        return self
+
+
 class ActionType(StrEnum):
     CREATE_INTERNAL_CASE_NOTE = "create_internal_case_note"
     APPLY_ACCOUNT_CREDIT = "apply_account_credit"

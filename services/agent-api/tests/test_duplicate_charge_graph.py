@@ -11,10 +11,12 @@ from pydantic import BaseModel, JsonValue
 
 from resolveops.api.runs import Principal, _execute_shell, _start_independent_execution
 from resolveops.graph.duplicate_charge import (
+    ASSESS_EVIDENCE_GAPS,
     CLASSIFY_CASE,
     COLLECT_INITIAL_EVIDENCE,
     ENFORCE_POLICY,
     NORMALIZE_INPUT,
+    PROPOSE_RESOLUTION,
     SELECT_INVESTIGATION_RECIPE,
     VALIDATE_DUPLICATE_CHARGE,
     VERIFY_EVIDENCE,
@@ -32,6 +34,12 @@ from resolveops.models.contracts import (
     WorkflowEvent,
     WorkflowEventType,
     WorkflowOutcome,
+)
+from resolveops.models.gateway import (
+    ModelCallMetadata,
+    ModelErrorCode,
+    ModelGatewayError,
+    ModelResult,
 )
 from resolveops.policies.duplicate_charge import (
     enforce_duplicate_charge_policy,
@@ -224,6 +232,7 @@ class FakePersistence:
         self.events: list[WorkflowEvent] = []
         self.attempts: list[dict[str, Any]] = []
         self.artifacts: list[RunArtifact] = []
+        self.model_calls: list[ModelCallMetadata] = []
         self.storage = InMemoryObjectStorage()
 
     def append_event(
@@ -296,6 +305,17 @@ class FakePersistence:
         attempt["status"] = "completed" if result.ok else "failed"
         attempt["response_summary"] = response_summary
 
+    def record_model_call(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        call: ModelCallMetadata,
+    ) -> None:
+        assert lease.run_id == call.run_id
+        assert organization_id == ORGANIZATION_ID
+        self.model_calls.append(call)
+
     def get_run_case(self, **kwargs: object) -> RunCase:
         del kwargs
         return RunCase(
@@ -344,7 +364,127 @@ class FailingObjectStorage:
         raise RuntimeError("synthetic artifact write failure")
 
 
-def invoke_graph(backend: FakeBackend) -> tuple[DuplicateChargeState, FakePersistence]:
+class DeterministicFakeModel:
+    def __init__(
+        self,
+        *,
+        fail_prompt: str | None = None,
+        classification_category: str = "duplicate_charge",
+        classification_confidence: float = 0.99,
+    ) -> None:
+        self.fail_prompt = fail_prompt
+        self.classification_category = classification_category
+        self.classification_confidence = classification_confidence
+        self.prompts: list[str] = []
+
+    def generate_structured(
+        self,
+        *,
+        prompt_name: str,
+        variables: dict[str, Any],
+        response_model: type[BaseModel],
+        trace_context: Any,
+        timeout_seconds: float,
+    ) -> Any:
+        del timeout_seconds
+        self.prompts.append(prompt_name)
+        if prompt_name == self.fail_prompt:
+            failed_call = ModelCallMetadata(
+                run_id=trace_context.run_id,
+                node_name=trace_context.node_name,
+                provider="fake",
+                requested_model="fake",
+                resolved_model=None,
+                prompt_name=prompt_name,
+                prompt_version=1,
+                generation_id=None,
+                input_tokens=0,
+                output_tokens=0,
+                reasoning_tokens=None,
+                cost_usd=0,
+                latency_ms=1,
+                status="failed",
+                error_code=ModelErrorCode.PROVIDER_5XX,
+            )
+            raise ModelGatewayError(
+                "deterministic fake failure",
+                error_code=ModelErrorCode.PROVIDER_5XX,
+                calls=(failed_call,),
+            )
+        evidence = variables.get("evidence", [])
+        citations = [item["evidence_id"] for item in evidence]
+        if prompt_name == "resolveops/classify-case":
+            raw: dict[str, Any] = {
+                "category": self.classification_category,
+                "urgency": "normal",
+                "confidence": self.classification_confidence,
+                "suspected_account_reference": "org_atlas_001",
+                "requested_outcome": "Investigate duplicate charges.",
+                "risk_indicators": [],
+            }
+        elif prompt_name == "resolveops/assess-evidence-gaps":
+            raw = {"sufficient": True, "requested_tools": [], "missing_data": []}
+        elif prompt_name == "resolveops/propose-resolution":
+            validation = variables["validation"]
+            raw = {
+                "resolution_code": validation["reason_code"],
+                "explanation": "Synthetic billing evidence was reviewed.",
+                "cited_evidence_ids": citations,
+                "recommended_next_step": (
+                    "Request reviewer approval."
+                    if validation["confirmed"]
+                    else "Do not change the account."
+                ),
+                "action_proposal": (
+                    {
+                        "action_type": "apply_account_credit",
+                        "target_reference": validation["account_id"],
+                        "parameters": {"amount_cents": 999_999},
+                        "rationale": "Credit the duplicate charge.",
+                        "cited_evidence_ids": citations,
+                    }
+                    if validation["confirmed"]
+                    else None
+                ),
+                "uncertain": False,
+                "missing_data": [],
+            }
+        elif prompt_name == "resolveops/draft-response":
+            raw = {
+                "subject": "Your synthetic AtlasFlow billing review",
+                "body": "We reviewed the synthetic billing evidence.",
+                "internal_case_note": "Evidence-backed draft generated.",
+                "cited_evidence_ids": citations,
+                "uncertainty_disclosure": None,
+            }
+        else:
+            raise AssertionError(f"unexpected prompt {prompt_name}")
+        output = response_model.model_validate(raw)
+        call = ModelCallMetadata(
+            run_id=trace_context.run_id,
+            node_name=trace_context.node_name,
+            provider="fake",
+            requested_model="fake",
+            resolved_model="fake/deterministic",
+            prompt_name=prompt_name,
+            prompt_version=1,
+            generation_id=f"fake-{len(self.prompts)}",
+            input_tokens=1,
+            output_tokens=1,
+            reasoning_tokens=None,
+            cost_usd=0,
+            latency_ms=0,
+            status="completed",
+            error_code=None,
+        )
+        return ModelResult(output=output, calls=(call,))
+
+
+def invoke_graph(
+    backend: FakeBackend,
+    *,
+    model_gateway: DeterministicFakeModel | None = None,
+) -> tuple[DuplicateChargeState, FakePersistence]:
     persistence = FakePersistence()
     lease = ExecutionLease(
         run_id=RUN_ID,
@@ -358,6 +498,7 @@ def invoke_graph(backend: FakeBackend) -> tuple[DuplicateChargeState, FakePersis
         object_storage=persistence.storage,
         lease=lease,
         organization_id=ORGANIZATION_ID,
+        model_gateway=model_gateway,
     )
     initial: DuplicateChargeState = {
         "run_id": RUN_ID,
@@ -373,6 +514,77 @@ def invoke_graph(backend: FakeBackend) -> tuple[DuplicateChargeState, FakePersis
         "emitted_events": [],
     }
     return cast(DuplicateChargeState, graph.invoke(initial)), persistence
+
+
+def test_fake_model_drives_all_four_structured_nodes_and_metadata_is_recorded() -> None:
+    model = DeterministicFakeModel()
+
+    result, persistence = invoke_graph(OnePaymentBackend(), model_gateway=model)
+
+    assert model.prompts == [
+        "resolveops/classify-case",
+        "resolveops/assess-evidence-gaps",
+        "resolveops/propose-resolution",
+        "resolveops/draft-response",
+    ]
+    assert [call.prompt_name for call in persistence.model_calls] == model.prompts
+    assert result["policy_decision"].outcome is WorkflowOutcome.NO_ACTION
+    assert result["final_response"].subject == "Your synthetic AtlasFlow billing review"
+
+
+def test_failed_resolution_model_forces_escalation_before_policy_action() -> None:
+    model = DeterministicFakeModel(fail_prompt="resolveops/propose-resolution")
+
+    result, persistence = invoke_graph(FakeBackend(), model_gateway=model)
+
+    assert result["policy_decision"].outcome is WorkflowOutcome.ESCALATE
+    assert result["policy_decision"].reason_code == "propose_resolution_model_unavailable"
+    assert result["workflow_outcome"] is WorkflowOutcome.ESCALATE
+    failed_call = next(
+        call
+        for call in persistence.model_calls
+        if call.prompt_name == "resolveops/propose-resolution"
+    )
+    assert failed_call.error_code is ModelErrorCode.PROVIDER_5XX
+    assert failed_call.status == "failed"
+    assert any(
+        event.event_type is WorkflowEventType.MODEL_FALLBACK
+        and event.node_name == PROPOSE_RESOLUTION
+        for event in persistence.events
+    )
+
+
+@pytest.mark.parametrize(
+    ("category", "confidence"),
+    [("unknown", 0.9), ("duplicate_charge", 0.2)],
+)
+def test_unsupported_or_low_confidence_classification_escalates_safely(
+    category: str,
+    confidence: float,
+) -> None:
+    model = DeterministicFakeModel(
+        classification_category=category,
+        classification_confidence=confidence,
+    )
+
+    result, _ = invoke_graph(FakeBackend(), model_gateway=model)
+
+    assert result["policy_decision"].outcome is WorkflowOutcome.ESCALATE
+    assert result["policy_decision"].reason_code == "unsupported_case_classification"
+    assert result["workflow_outcome"] is WorkflowOutcome.ESCALATE
+
+
+def test_optional_draft_model_failure_uses_cited_deterministic_template() -> None:
+    model = DeterministicFakeModel(fail_prompt="resolveops/draft-response")
+
+    result, persistence = invoke_graph(OnePaymentBackend(), model_gateway=model)
+
+    assert result["policy_decision"].outcome is WorkflowOutcome.NO_ACTION
+    assert "did not make an account change" in result["final_response"].body
+    assert any(
+        event.event_type is WorkflowEventType.MODEL_FALLBACK and event.node_name == "draft_response"
+        for event in persistence.events
+    )
 
 
 def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_events() -> None:
@@ -397,8 +609,10 @@ def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_even
         CLASSIFY_CASE,
         SELECT_INVESTIGATION_RECIPE,
         COLLECT_INITIAL_EVIDENCE,
+        ASSESS_EVIDENCE_GAPS,
         VERIFY_EVIDENCE,
         VALIDATE_DUPLICATE_CHARGE,
+        PROPOSE_RESOLUTION,
         ENFORCE_POLICY,
     }.issubset(graph.nodes)
 

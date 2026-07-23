@@ -11,11 +11,13 @@ from resolveops.models.contracts import (
     ApprovalDecisionType,
     CaseClassification,
     DuplicateChargeValidation,
+    EvidenceGapAssessment,
     EvidenceItem,
     EvidenceVerification,
     FinalResponse,
     InvestigationPlan,
     PolicyDecision,
+    ResolutionProposal,
     RunArtifact,
     TicketInput,
     WorkflowEvent,
@@ -29,13 +31,17 @@ class DuplicateChargeState(TypedDict, total=False):
     ticket: TicketInput
     case_created_at: str
     classification: CaseClassification
+    classification_requires_escalation: bool
     investigation_plan: InvestigationPlan
     account_id: str
     invoice_ids: list[str]
     evidence: Annotated[list[EvidenceItem], add]
     tool_errors: Annotated[list[str], add]
+    evidence_gap_assessment: EvidenceGapAssessment
     evidence_verification: EvidenceVerification
     duplicate_charge_validation: DuplicateChargeValidation
+    resolution: ResolutionProposal
+    model_failure_node: str
     policy_decision: PolicyDecision
     final_response: FinalResponse
     finalized_artifacts: list[RunArtifact]

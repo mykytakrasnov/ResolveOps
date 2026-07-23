@@ -44,6 +44,7 @@ from resolveops.models.contracts import (
     WorkflowEventType,
     WorkflowOutcome,
 )
+from resolveops.models.gateway import ModelCallMetadata, ModelErrorCode
 from resolveops.repositories.runs import (
     ActionExecutionAuthorizationError,
     ApprovalGateRecords,
@@ -715,6 +716,114 @@ def test_execute_approved_action_requires_a_matching_persisted_approval(
         )
 
 
+def test_model_call_metadata_is_persisted_and_success_usage_updates_the_run(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    repository = DatabaseRunRepository(database_url)
+    created = repository.create_run(
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        case_id=seeded_case.case_id,
+        idempotency_key=uuid4(),
+    )
+    lease = repository.acquire_execution_lease(
+        run_id=created.run.run_id,
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        lease_seconds=60,
+    )
+    completed = ModelCallMetadata(
+        run_id=created.run.run_id,
+        node_name="classify_case",
+        provider="openrouter",
+        requested_model="openrouter/free",
+        resolved_model="openai/gpt-test",
+        prompt_name="resolveops/classify-case",
+        prompt_version=1,
+        generation_id="gen-test-success",
+        input_tokens=23,
+        output_tokens=17,
+        reasoning_tokens=3,
+        cost_usd=0.00012,
+        latency_ms=45,
+        status="completed",
+        error_code=None,
+    )
+    failed = ModelCallMetadata(
+        run_id=created.run.run_id,
+        node_name="propose_resolution",
+        provider="openrouter",
+        requested_model="openrouter/free",
+        resolved_model=None,
+        prompt_name="resolveops/propose-resolution",
+        prompt_version=1,
+        generation_id=None,
+        input_tokens=0,
+        output_tokens=0,
+        reasoning_tokens=None,
+        cost_usd=0,
+        latency_ms=5_000,
+        status="failed",
+        error_code=ModelErrorCode.TIMEOUT,
+    )
+
+    repository.record_model_call(
+        lease=lease,
+        organization_id=seeded_case.principal.organization_id,
+        call=completed,
+    )
+    repository.record_model_call(
+        lease=lease,
+        organization_id=seeded_case.principal.organization_id,
+        call=failed,
+    )
+
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT node_name, resolved_model, prompt_name, prompt_version, generation_id,
+                   input_tokens, output_tokens, reasoning_tokens, cost_usd, latency_ms,
+                   status, error_code
+            FROM app.model_calls
+            WHERE run_id = %s
+            ORDER BY created_at, node_name
+            """,
+            (created.run.run_id,),
+        )
+        rows = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT resolved_model, input_tokens, output_tokens, cost_usd
+            FROM app.workflow_runs
+            WHERE id = %s
+            """,
+            (created.run.run_id,),
+        )
+        run_totals = cursor.fetchone()
+
+    assert len(rows) == 2
+    assert {row[10] for row in rows} == {"completed", "failed"}
+    completed_row = next(row for row in rows if row[10] == "completed")
+    failed_row = next(row for row in rows if row[10] == "failed")
+    assert completed_row[:8] == (
+        "classify_case",
+        "openai/gpt-test",
+        "resolveops/classify-case",
+        1,
+        "gen-test-success",
+        23,
+        17,
+        3,
+    )
+    assert float(completed_row[8]) == pytest.approx(0.00012)
+    assert completed_row[9:] == (45, "completed", None)
+    assert failed_row[9:] == (5_000, "failed", "timeout")
+    assert run_totals is not None
+    assert run_totals[:3] == ("openai/gpt-test", 23, 17)
+    assert float(run_totals[3]) == pytest.approx(0.00012)
+
+
 def test_execute_approved_action_refuses_rejected_and_stale_decisions(
     database_url: str,
     seeded_case: SeededCase,
@@ -855,7 +964,9 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
         assert response.status_code == 200, response.text
         assert response.headers["content-type"].startswith("text/event-stream")
         event_ids = [line for line in response.text.splitlines() if line.startswith("id: ")]
-        assert event_ids == [f"id: {sequence}" for sequence in range(1, 40)]
+        event_sequences = [int(event_id.removeprefix("id: ")) for event_id in event_ids]
+        assert event_sequences == list(range(1, len(event_sequences) + 1))
+        last_sequence = event_sequences[-1]
 
         run_response = client.get(f"/api/v1/runs/{run_id}")
         assert run_response.status_code == 200
@@ -864,8 +975,10 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
 
         reconnect = client.get(f"/api/v1/runs/{run_id}/events?after_sequence=2")
         assert reconnect.status_code == 200
-        assert [event["sequence"] for event in reconnect.json()["events"]] == list(range(3, 40))
-        assert reconnect.json()["last_sequence"] == 39
+        assert [event["sequence"] for event in reconnect.json()["events"]] == list(
+            range(3, last_sequence + 1)
+        )
+        assert reconnect.json()["last_sequence"] == last_sequence
 
         replay = client.post(
             f"/api/v1/runs/{run_id}/execute",

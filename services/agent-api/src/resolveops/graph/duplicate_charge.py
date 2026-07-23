@@ -1,4 +1,4 @@
-"""First production workflow slice: deterministic duplicate-charge evidence collection."""
+"""Bounded duplicate-charge workflow with model-assisted, deterministic safety seams."""
 
 from __future__ import annotations
 
@@ -20,19 +20,24 @@ from resolveops.db.checkpoints import open_async_postgres_saver
 from resolveops.graph.state import DuplicateChargeState
 from resolveops.models.contracts import (
     ActionExecutionStatus,
+    ActionProposalInput,
     ActionResult,
+    ActionType,
     ApprovalDecisionType,
     ArtifactKind,
     CaseCategory,
     CaseClassification,
     EvidenceClaim,
+    EvidenceGapAssessment,
     EvidenceItem,
     EvidenceVerification,
     FinalResponse,
     InvestigationPlan,
     PolicyDecision,
     ReadToolName,
+    ResolutionProposal,
     RiskIndicator,
+    RiskLevel,
     RunArtifact,
     SourceSystem,
     TicketInput,
@@ -41,6 +46,12 @@ from resolveops.models.contracts import (
     WorkflowEvent,
     WorkflowEventType,
     WorkflowOutcome,
+)
+from resolveops.models.gateway import (
+    ModelCallMetadata,
+    ModelGateway,
+    ModelGatewayError,
+    TraceContext,
 )
 from resolveops.policies.duplicate_charge import (
     enforce_duplicate_charge_policy,
@@ -69,8 +80,10 @@ NORMALIZE_INPUT = "normalize_input"
 CLASSIFY_CASE = "classify_case"
 SELECT_INVESTIGATION_RECIPE = "select_investigation_recipe"
 COLLECT_INITIAL_EVIDENCE = "collect_initial_evidence"
+ASSESS_EVIDENCE_GAPS = "assess_evidence_gaps"
 VERIFY_EVIDENCE = "verify_evidence"
 VALIDATE_DUPLICATE_CHARGE = "validate_duplicate_charge"
+PROPOSE_RESOLUTION = "propose_resolution"
 ENFORCE_POLICY = "enforce_policy"
 ESCALATE_CASE = "escalate_case"
 DRAFT_RESPONSE = "draft_response"
@@ -82,6 +95,8 @@ DUPLICATE_CHARGE_RECIPE = "duplicate_charge_v1"
 BILLING_POLICY_KEY = "billing_duplicate_credit"
 BILLING_POLICY_VERSION = "3.0"
 MAX_INVOICES_FOR_PAYMENT_LOOKUP = 6
+MODEL_TIMEOUT_SECONDS = 20.0
+MIN_CLASSIFICATION_CONFIDENCE = 0.6
 
 
 class WorkflowPersistence(Protocol):
@@ -116,6 +131,14 @@ class WorkflowPersistence(Protocol):
         tool_name: ReadToolName,
         result: ToolResult[BaseModel],
         response_summary: dict[str, str | int | list[str]],
+    ) -> None: ...
+
+    def record_model_call(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        call: ModelCallMetadata,
     ) -> None: ...
 
     def record_artifact(
@@ -252,6 +275,7 @@ def build_duplicate_charge_graph(
     object_storage: ObjectStorage,
     lease: ExecutionLease,
     organization_id: UUID,
+    model_gateway: ModelGateway | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     enable_approval_interrupt: bool = False,
 ) -> CompiledStateGraph[DuplicateChargeState, None, Any, Any]:
@@ -280,7 +304,12 @@ def build_duplicate_charge_graph(
                 persistence,
                 lease,
                 organization_id,
-                _classify_case,
+                _classification_operation(
+                    model_gateway,
+                    persistence,
+                    lease,
+                    organization_id,
+                ),
             ),
         ),
     )
@@ -310,6 +339,18 @@ def build_duplicate_charge_graph(
         ),
     )
     graph.add_node(
+        ASSESS_EVIDENCE_GAPS,
+        cast(
+            Any,
+            _evidence_gap_node(
+                model_gateway=model_gateway,
+                persistence=persistence,
+                lease=lease,
+                organization_id=organization_id,
+            ),
+        ),
+    )
+    graph.add_node(
         VERIFY_EVIDENCE,
         cast(
             Any,
@@ -330,6 +371,18 @@ def build_duplicate_charge_graph(
                 lease,
                 organization_id,
                 _validate_duplicate_charge_evidence,
+            ),
+        ),
+    )
+    graph.add_node(
+        PROPOSE_RESOLUTION,
+        cast(
+            Any,
+            _proposal_node(
+                model_gateway=model_gateway,
+                persistence=persistence,
+                lease=lease,
+                organization_id=organization_id,
             ),
         ),
     )
@@ -389,6 +442,7 @@ def build_duplicate_charge_graph(
         cast(
             Any,
             _draft_response_node(
+                model_gateway=model_gateway,
                 persistence=persistence,
                 lease=lease,
                 organization_id=organization_id,
@@ -411,9 +465,11 @@ def build_duplicate_charge_graph(
     graph.add_edge(NORMALIZE_INPUT, CLASSIFY_CASE)
     graph.add_edge(CLASSIFY_CASE, SELECT_INVESTIGATION_RECIPE)
     graph.add_edge(SELECT_INVESTIGATION_RECIPE, COLLECT_INITIAL_EVIDENCE)
-    graph.add_edge(COLLECT_INITIAL_EVIDENCE, VERIFY_EVIDENCE)
+    graph.add_edge(COLLECT_INITIAL_EVIDENCE, ASSESS_EVIDENCE_GAPS)
+    graph.add_edge(ASSESS_EVIDENCE_GAPS, VERIFY_EVIDENCE)
     graph.add_edge(VERIFY_EVIDENCE, VALIDATE_DUPLICATE_CHARGE)
-    graph.add_edge(VALIDATE_DUPLICATE_CHARGE, ENFORCE_POLICY)
+    graph.add_edge(VALIDATE_DUPLICATE_CHARGE, PROPOSE_RESOLUTION)
+    graph.add_edge(PROPOSE_RESOLUTION, ENFORCE_POLICY)
     graph.add_conditional_edges(
         ENFORCE_POLICY,
         _route_policy_outcome,
@@ -450,6 +506,7 @@ def execute_duplicate_charge_graph(
     organization_id: UUID,
     ticket: TicketInput,
     case_created_at: datetime,
+    model_gateway: ModelGateway | None = None,
 ) -> Generator[WorkflowEvent, None, tuple[WorkflowOutcome, str]]:
     graph = build_duplicate_charge_graph(
         tools=tools,
@@ -457,6 +514,7 @@ def execute_duplicate_charge_graph(
         object_storage=object_storage,
         lease=lease,
         organization_id=organization_id,
+        model_gateway=model_gateway,
     )
     initial: DuplicateChargeState = {
         "run_id": lease.run_id,
@@ -497,6 +555,7 @@ async def execute_checkpointed_duplicate_charge_graph(
     ticket: TicketInput,
     case_created_at: datetime,
     checkpoint_dsn: str,
+    model_gateway: ModelGateway | None = None,
 ) -> CheckpointedGraphExecution:
     """Execute with durable PostgreSQL state and verify an interrupt before returning."""
 
@@ -521,6 +580,7 @@ async def execute_checkpointed_duplicate_charge_graph(
             object_storage=object_storage,
             lease=lease,
             organization_id=organization_id,
+            model_gateway=model_gateway,
             checkpointer=checkpointer,
             enable_approval_interrupt=True,
         )
@@ -587,6 +647,7 @@ async def resume_checkpointed_duplicate_charge_graph(
     organization_id: UUID,
     decision: ApprovalDecisionType,
     checkpoint_dsn: str,
+    model_gateway: ModelGateway | None = None,
 ) -> CheckpointedGraphExecution:
     """Resume only the stored approval interrupt with an authoritative persisted decision."""
 
@@ -604,6 +665,7 @@ async def resume_checkpointed_duplicate_charge_graph(
             object_storage=object_storage,
             lease=lease,
             organization_id=organization_id,
+            model_gateway=model_gateway,
             checkpointer=checkpointer,
             enable_approval_interrupt=True,
         )
@@ -679,7 +741,8 @@ def _with_node_events(
             status="completed",
             public_payload={"summary": f"{node_name} completed."},
         )
-        update["emitted_events"] = [started, completed]
+        operation_events = update.get("emitted_events", [])
+        update["emitted_events"] = [started, *operation_events, completed]
         return update
 
     return node
@@ -691,7 +754,72 @@ def _normalize_input(state: DuplicateChargeState) -> DuplicateChargeState:
     return {"ticket": normalized}
 
 
-def _classify_case(state: DuplicateChargeState) -> DuplicateChargeState:
+def _classification_operation(
+    model_gateway: ModelGateway | None,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+    def operation(state: DuplicateChargeState) -> DuplicateChargeState:
+        if model_gateway is None:
+            classification = _deterministic_classification(state)
+            return {
+                "classification": classification,
+                "classification_requires_escalation": _classification_requires_escalation(
+                    classification
+                ),
+            }
+        try:
+            result = model_gateway.generate_structured(
+                prompt_name="resolveops/classify-case",
+                variables={"ticket": state["ticket"].model_dump(mode="json")},
+                response_model=CaseClassification,
+                trace_context=TraceContext(run_id=lease.run_id, node_name=CLASSIFY_CASE),
+                timeout_seconds=MODEL_TIMEOUT_SECONDS,
+            )
+        except ModelGatewayError as error:
+            events = _record_model_calls(
+                persistence=persistence,
+                lease=lease,
+                organization_id=organization_id,
+                calls=error.calls,
+            )
+            events.append(
+                _model_fallback_event(
+                    persistence=persistence,
+                    lease=lease,
+                    organization_id=organization_id,
+                    node_name=CLASSIFY_CASE,
+                    fallback="rule_based_classifier",
+                    error_code=error.error_code.value,
+                )
+            )
+            classification = _deterministic_classification(state)
+            return {
+                "classification": classification,
+                "classification_requires_escalation": _classification_requires_escalation(
+                    classification
+                ),
+                "emitted_events": events,
+            }
+        events = _record_model_calls(
+            persistence=persistence,
+            lease=lease,
+            organization_id=organization_id,
+            calls=result.calls,
+        )
+        return {
+            "classification": result.output,
+            "classification_requires_escalation": _classification_requires_escalation(
+                result.output
+            ),
+            "emitted_events": events,
+        }
+
+    return operation
+
+
+def _deterministic_classification(state: DuplicateChargeState) -> CaseClassification:
     ticket = state["ticket"]
     content = f"{ticket.subject} {ticket.body}".lower()
     duplicate_terms = ("charged twice", "duplicate charge", "two completed charges")
@@ -710,17 +838,22 @@ def _classify_case(state: DuplicateChargeState) -> DuplicateChargeState:
         if category is CaseCategory.UNKNOWN
         else [],
     )
-    return {"classification": classification}
+    return classification
+
+
+def _classification_requires_escalation(classification: CaseClassification) -> bool:
+    return (
+        classification.category is not CaseCategory.DUPLICATE_CHARGE
+        or classification.confidence < MIN_CLASSIFICATION_CONFIDENCE
+    )
 
 
 def _select_investigation_recipe(state: DuplicateChargeState) -> DuplicateChargeState:
     classification = state["classification"]
-    if classification.category is not CaseCategory.DUPLICATE_CHARGE:
-        raise ValueError("only duplicate-charge cases are supported by this graph slice")
     return {
         "investigation_plan": InvestigationPlan(
             recipe_id=DUPLICATE_CHARGE_RECIPE,
-            category=CaseCategory.DUPLICATE_CHARGE,
+            category=classification.category,
             required_tools=[
                 ReadToolName.LOOKUP_CUSTOMER,
                 ReadToolName.GET_SUBSCRIPTION,
@@ -801,6 +934,113 @@ def _collect_node(
     return node
 
 
+def _evidence_gap_node(
+    *,
+    model_gateway: ModelGateway | None,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+    def node(state: DuplicateChargeState) -> DuplicateChargeState:
+        started = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_STARTED,
+            node_name=ASSESS_EVIDENCE_GAPS,
+            status="running",
+            public_payload={"summary": "Evidence-gap assessment started."},
+        )
+        events = [started]
+        failure_node: str | None = None
+        if model_gateway is None:
+            assessment = _deterministic_gap_assessment(state)
+        else:
+            try:
+                result = model_gateway.generate_structured(
+                    prompt_name="resolveops/assess-evidence-gaps",
+                    variables={
+                        "allowlisted_tools": [
+                            tool.value for tool in state["investigation_plan"].optional_tools
+                        ],
+                        "evidence": [
+                            item.model_dump(mode="json") for item in state.get("evidence", [])
+                        ],
+                    },
+                    response_model=EvidenceGapAssessment,
+                    trace_context=TraceContext(
+                        run_id=lease.run_id,
+                        node_name=ASSESS_EVIDENCE_GAPS,
+                    ),
+                    timeout_seconds=MODEL_TIMEOUT_SECONDS,
+                )
+            except ModelGatewayError as error:
+                events.extend(
+                    _record_model_calls(
+                        persistence=persistence,
+                        lease=lease,
+                        organization_id=organization_id,
+                        calls=error.calls,
+                    )
+                )
+                assessment = EvidenceGapAssessment(
+                    sufficient=False,
+                    missing_data=["model_provider_unavailable"],
+                )
+                events.append(
+                    _model_fallback_event(
+                        persistence=persistence,
+                        lease=lease,
+                        organization_id=organization_id,
+                        node_name=ASSESS_EVIDENCE_GAPS,
+                        fallback="escalate",
+                        error_code=error.error_code.value,
+                    )
+                )
+                failure_node = ASSESS_EVIDENCE_GAPS
+            else:
+                events.extend(
+                    _record_model_calls(
+                        persistence=persistence,
+                        lease=lease,
+                        organization_id=organization_id,
+                        calls=result.calls,
+                    )
+                )
+                assessment = result.output
+        completed = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_COMPLETED,
+            node_name=ASSESS_EVIDENCE_GAPS,
+            status="completed" if assessment.sufficient else "completed_with_gaps",
+            public_payload={
+                "summary": "Evidence-gap assessment completed.",
+                "sufficient": assessment.sufficient,
+                "requested_tool_count": len(assessment.requested_tools),
+                "missing_data_count": len(assessment.missing_data),
+            },
+        )
+        events.append(completed)
+        update: DuplicateChargeState = {
+            "evidence_gap_assessment": assessment,
+            "emitted_events": events,
+        }
+        if failure_node is not None:
+            update["model_failure_node"] = failure_node
+        return update
+
+    return node
+
+
+def _deterministic_gap_assessment(state: DuplicateChargeState) -> EvidenceGapAssessment:
+    errors = state.get("tool_errors", [])
+    return (
+        EvidenceGapAssessment(sufficient=True)
+        if not errors
+        else EvidenceGapAssessment(sufficient=False, missing_data=errors[:4])
+    )
+
+
 def _verification_node(
     *,
     persistence: WorkflowPersistence,
@@ -860,6 +1100,120 @@ def _validate_duplicate_charge_evidence(state: DuplicateChargeState) -> Duplicat
     return {"duplicate_charge_validation": validate_duplicate_charge(state.get("evidence", []))}
 
 
+def _proposal_node(
+    *,
+    model_gateway: ModelGateway | None,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+    def node(state: DuplicateChargeState) -> DuplicateChargeState:
+        started = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_STARTED,
+            node_name=PROPOSE_RESOLUTION,
+            status="running",
+            public_payload={"summary": "Evidence-backed resolution proposal started."},
+        )
+        events = [started]
+        failure_node: str | None = None
+        if model_gateway is None:
+            proposal = _deterministic_resolution_proposal(state)
+        else:
+            try:
+                result = model_gateway.generate_structured(
+                    prompt_name="resolveops/propose-resolution",
+                    variables={
+                        "validation": state["duplicate_charge_validation"].model_dump(mode="json"),
+                        "evidence": [
+                            item.model_dump(mode="json") for item in state.get("evidence", [])
+                        ],
+                    },
+                    response_model=ResolutionProposal,
+                    trace_context=TraceContext(run_id=lease.run_id, node_name=PROPOSE_RESOLUTION),
+                    timeout_seconds=MODEL_TIMEOUT_SECONDS,
+                )
+            except ModelGatewayError as error:
+                events.extend(
+                    _record_model_calls(
+                        persistence=persistence,
+                        lease=lease,
+                        organization_id=organization_id,
+                        calls=error.calls,
+                    )
+                )
+                proposal = _deterministic_resolution_proposal(state)
+                failure_node = PROPOSE_RESOLUTION
+                events.append(
+                    _model_fallback_event(
+                        persistence=persistence,
+                        lease=lease,
+                        organization_id=organization_id,
+                        node_name=PROPOSE_RESOLUTION,
+                        fallback="escalate",
+                        error_code=error.error_code.value,
+                    )
+                )
+            else:
+                events.extend(
+                    _record_model_calls(
+                        persistence=persistence,
+                        lease=lease,
+                        organization_id=organization_id,
+                        calls=result.calls,
+                    )
+                )
+                proposal = result.output
+        completed = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_COMPLETED,
+            node_name=PROPOSE_RESOLUTION,
+            status="completed" if failure_node is None else "completed_with_fallback",
+            public_payload={
+                "summary": "Resolution proposal completed.",
+                "resolution_code": proposal.resolution_code,
+                "citation_count": len(proposal.cited_evidence_ids),
+                "action_recommended": proposal.action_proposal is not None,
+            },
+        )
+        events.append(completed)
+        update: DuplicateChargeState = {"resolution": proposal, "emitted_events": events}
+        if failure_node is not None:
+            update["model_failure_node"] = failure_node
+        return update
+
+    return node
+
+
+def _deterministic_resolution_proposal(state: DuplicateChargeState) -> ResolutionProposal:
+    validation = state["duplicate_charge_validation"]
+    citations = state["evidence_verification"].validated_evidence_ids
+    if validation.confirmed and validation.account_id is not None:
+        return ResolutionProposal(
+            resolution_code="duplicate_charge_confirmed",
+            explanation="Deterministic evidence validation confirmed a duplicate charge.",
+            cited_evidence_ids=citations,
+            recommended_next_step="Request reviewer approval for an account credit.",
+            action_proposal=ActionProposalInput(
+                action_type=ActionType.APPLY_ACCOUNT_CREDIT,
+                target_reference=validation.account_id,
+                parameters={},
+                rationale="Credit the code-confirmed duplicate charge after human review.",
+                cited_evidence_ids=citations,
+            ),
+        )
+    return ResolutionProposal(
+        resolution_code=validation.reason_code,
+        explanation="Deterministic evidence validation did not confirm a duplicate charge.",
+        cited_evidence_ids=citations,
+        recommended_next_step="Do not change the account.",
+        uncertain=not state["evidence_verification"].verified,
+        missing_data=state["evidence_verification"].missing_evidence_types,
+    )
+
+
 def _policy_node(
     *,
     persistence: WorkflowPersistence,
@@ -875,11 +1229,33 @@ def _policy_node(
             status="running",
             public_payload={"summary": "Billing-credit policy evaluation started."},
         )
-        decision = enforce_duplicate_charge_policy(
-            evidence=state.get("evidence", []),
-            verification=state["evidence_verification"],
-            validation=state["duplicate_charge_validation"],
-        )
+        failure_node = state.get("model_failure_node")
+        assessment = state["evidence_gap_assessment"]
+        if state.get("classification_requires_escalation", False):
+            decision = PolicyDecision(
+                outcome=WorkflowOutcome.ESCALATE,
+                risk_level=RiskLevel.R1,
+                reason_code="unsupported_case_classification",
+            )
+        elif failure_node is not None:
+            decision = PolicyDecision(
+                outcome=WorkflowOutcome.ESCALATE,
+                risk_level=RiskLevel.R1,
+                reason_code=f"{failure_node}_model_unavailable",
+            )
+        elif not assessment.sufficient:
+            decision = PolicyDecision(
+                outcome=WorkflowOutcome.ESCALATE,
+                risk_level=RiskLevel.R1,
+                reason_code="evidence_gap_unresolved",
+            )
+        else:
+            decision = enforce_duplicate_charge_policy(
+                evidence=state.get("evidence", []),
+                verification=state["evidence_verification"],
+                validation=state["duplicate_charge_validation"],
+                untrusted_proposal=state["resolution"],
+            )
         evaluated = persistence.append_event(
             lease=lease,
             organization_id=organization_id,
@@ -1034,8 +1410,68 @@ def _execute_approved_action_node(
     return node
 
 
+def _record_model_calls(
+    *,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+    calls: Sequence[ModelCallMetadata],
+) -> list[WorkflowEvent]:
+    events: list[WorkflowEvent] = []
+    for call in calls:
+        persistence.record_model_call(
+            lease=lease,
+            organization_id=organization_id,
+            call=call,
+        )
+        if call.status == "completed":
+            continue
+        events.append(
+            persistence.append_event(
+                lease=lease,
+                organization_id=organization_id,
+                event_type=WorkflowEventType.MODEL_RETRY,
+                node_name=call.node_name,
+                status=call.status,
+                public_payload={
+                    "summary": "A structured model attempt did not complete successfully.",
+                    "error_code": call.error_code.value
+                    if call.error_code is not None
+                    else "unknown",
+                    "prompt_name": call.prompt_name,
+                    "prompt_version": call.prompt_version,
+                },
+            )
+        )
+    return events
+
+
+def _model_fallback_event(
+    *,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+    node_name: str,
+    fallback: str,
+    error_code: str,
+) -> WorkflowEvent:
+    return persistence.append_event(
+        lease=lease,
+        organization_id=organization_id,
+        event_type=WorkflowEventType.MODEL_FALLBACK,
+        node_name=node_name,
+        status="completed",
+        public_payload={
+            "summary": "A safe deterministic model fallback was applied.",
+            "fallback": fallback,
+            "error_code": error_code,
+        },
+    )
+
+
 def _draft_response_node(
     *,
+    model_gateway: ModelGateway | None,
     persistence: WorkflowPersistence,
     lease: ExecutionLease,
     organization_id: UUID,
@@ -1048,20 +1484,75 @@ def _draft_response_node(
             event_type=WorkflowEventType.NODE_STARTED,
             node_name=DRAFT_RESPONSE,
             status="running",
-            public_payload={"summary": "Deterministic response drafting started."},
+            public_payload={"summary": "Customer response drafting started."},
         )
-        final_response = _deterministic_fallback_draft(state, outcome=outcome)
-        fallback = persistence.append_event(
-            lease=lease,
-            organization_id=organization_id,
-            event_type=WorkflowEventType.MODEL_FALLBACK,
-            node_name=DRAFT_RESPONSE,
-            status="completed",
-            public_payload={
-                "summary": "A deterministic evidence-cited response template was used.",
-                "fallback": "deterministic_template",
-            },
-        )
+        events = [started]
+        fallback_error: str | None = None
+        if model_gateway is None:
+            final_response = _deterministic_fallback_draft(state, outcome=outcome)
+            fallback_error = "model_gateway_not_configured"
+        else:
+            try:
+                result = model_gateway.generate_structured(
+                    prompt_name="resolveops/draft-response",
+                    variables={
+                        "outcome": {
+                            "workflow_outcome": outcome.value,
+                            "reason_code": state.get(
+                                "workflow_reason_code",
+                                state["policy_decision"].reason_code,
+                            ),
+                            "action_status": (
+                                state["action_result"].status.value
+                                if "action_result" in state
+                                else None
+                            ),
+                        },
+                        "evidence": [
+                            item.model_dump(mode="json") for item in state.get("evidence", [])
+                        ],
+                    },
+                    response_model=FinalResponse,
+                    trace_context=TraceContext(run_id=lease.run_id, node_name=DRAFT_RESPONSE),
+                    timeout_seconds=MODEL_TIMEOUT_SECONDS,
+                )
+            except ModelGatewayError as error:
+                events.extend(
+                    _record_model_calls(
+                        persistence=persistence,
+                        lease=lease,
+                        organization_id=organization_id,
+                        calls=error.calls,
+                    )
+                )
+                final_response = _deterministic_fallback_draft(state, outcome=outcome)
+                fallback_error = error.error_code.value
+            else:
+                events.extend(
+                    _record_model_calls(
+                        persistence=persistence,
+                        lease=lease,
+                        organization_id=organization_id,
+                        calls=result.calls,
+                    )
+                )
+                allowed_citations = set(state["evidence_verification"].validated_evidence_ids)
+                if not set(result.output.cited_evidence_ids).issubset(allowed_citations):
+                    final_response = _deterministic_fallback_draft(state, outcome=outcome)
+                    fallback_error = "unsupported_evidence_citation"
+                else:
+                    final_response = result.output
+        if fallback_error is not None:
+            events.append(
+                _model_fallback_event(
+                    persistence=persistence,
+                    lease=lease,
+                    organization_id=organization_id,
+                    node_name=DRAFT_RESPONSE,
+                    fallback="deterministic_template",
+                    error_code=fallback_error,
+                )
+            )
         completed = persistence.append_event(
             lease=lease,
             organization_id=organization_id,
@@ -1074,10 +1565,11 @@ def _draft_response_node(
                 "uncertainty_disclosed": final_response.uncertainty_disclosure is not None,
             },
         )
+        events.append(completed)
         return {
             "final_response": final_response,
             "workflow_outcome": outcome,
-            "emitted_events": [started, fallback, completed],
+            "emitted_events": events,
         }
 
     return node
