@@ -25,6 +25,7 @@ from resolveops.models.contracts import (
     ApprovalDecisionType,
     ApprovalRequest,
     ArtifactKind,
+    InternalTraceIdentifiers,
     PolicyDecision,
     ProposalStatus,
     ReadToolName,
@@ -102,6 +103,10 @@ class ActionExecutionAuthorizationError(RunRepositoryError):
     pass
 
 
+class ReportNotReadyError(RunRepositoryError):
+    pass
+
+
 @dataclass(frozen=True)
 class CreatedRun:
     run: WorkflowRun
@@ -124,6 +129,7 @@ class ExecutionStart:
 
 @dataclass(frozen=True)
 class RunCase:
+    case_id: UUID
     ticket: TicketInput
     created_at: datetime
 
@@ -140,6 +146,14 @@ class RecordedApprovalDecision:
     approval_request: ApprovalRequest
     idempotent_replay: bool
     lease: ExecutionLease | None
+
+
+@dataclass(frozen=True)
+class RunReportRecord:
+    run_id: UUID
+    status: RunStatus
+    internal_trace_identifiers: InternalTraceIdentifiers
+    artifacts: tuple[RunArtifact, ...]
 
 
 def _canonical_json(value: object) -> str:
@@ -299,6 +313,76 @@ class DatabaseRunRepository:
             if row is None:
                 raise RunNotFoundError("run not found")
             return _run_from_row(row)
+
+    def get_report(
+        self,
+        *,
+        run_id: UUID,
+        organization_id: UUID,
+        actor_user_id: UUID,
+        allow_all: bool = False,
+    ) -> RunReportRecord:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, status, thread_id, langfuse_trace_id, aws_request_id
+                FROM app.workflow_runs
+                WHERE id = %s AND organization_id = %s
+                  AND (initiated_by = %s OR %s)
+                """,
+                (run_id, organization_id, actor_user_id, allow_all),
+            )
+            run = cursor.fetchone()
+            if run is None:
+                raise RunNotFoundError("run not found")
+            run_status = RunStatus(run["status"])
+            if run_status not in {RunStatus.COMPLETED, RunStatus.ESCALATED}:
+                raise ReportNotReadyError("run report is not available until the run is terminal")
+            cursor.execute(
+                """
+                SELECT id, run_id, kind, object_key, mime_type, sha256,
+                       size_bytes, created_at
+                FROM app.run_artifacts
+                WHERE run_id = %s
+                ORDER BY kind
+                """,
+                (run_id,),
+            )
+            artifacts = tuple(_artifact_from_row(row) for row in cursor.fetchall())
+            if not artifacts:
+                raise ReportNotReadyError("run report artifacts are unavailable")
+            identifiers = InternalTraceIdentifiers(
+                workflow_run_id=run_id,
+                langgraph_thread_id=run["thread_id"],
+                langfuse_trace_id=run["langfuse_trace_id"],
+                aws_request_id=run["aws_request_id"],
+            )
+            return RunReportRecord(
+                run_id=run_id,
+                status=run_status,
+                internal_trace_identifiers=identifiers,
+                artifacts=artifacts,
+            )
+
+    def get_report_artifact(
+        self,
+        *,
+        run_id: UUID,
+        organization_id: UUID,
+        actor_user_id: UUID,
+        kind: ArtifactKind,
+        allow_all: bool = False,
+    ) -> RunArtifact:
+        report = self.get_report(
+            run_id=run_id,
+            organization_id=organization_id,
+            actor_user_id=actor_user_id,
+            allow_all=allow_all,
+        )
+        artifact = next((item for item in report.artifacts if item.kind is kind), None)
+        if artifact is None:
+            raise ReportNotReadyError(f"{kind.value} artifact is unavailable")
+        return artifact
 
     def list_events(
         self,
@@ -878,7 +962,7 @@ class DatabaseRunRepository:
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT support.subject, support.body, support.customer_reference,
+                SELECT support.id, support.subject, support.body, support.customer_reference,
                        support.attachment_keys, support.created_at
                 FROM app.workflow_runs AS run
                 JOIN app.support_cases AS support
@@ -893,6 +977,7 @@ class DatabaseRunRepository:
             if row is None:
                 raise RunNotFoundError("run not found")
             return RunCase(
+                case_id=row["id"],
                 ticket=TicketInput(
                     subject=row["subject"],
                     body=row["body"],
@@ -1278,6 +1363,14 @@ class DatabaseRunRepository:
             ArtifactKind.MARKDOWN_BRIEF: (
                 f"runs/{lease.run_id}/report.md",
                 "text/markdown; charset=utf-8",
+            ),
+            ArtifactKind.CUSTOMER_RESPONSE: (
+                f"runs/{lease.run_id}/customer-response.txt",
+                "text/plain; charset=utf-8",
+            ),
+            ArtifactKind.PUBLIC_EVENTS: (
+                f"runs/{lease.run_id}/events.jsonl",
+                "application/x-ndjson",
             ),
         }.get(kind)
         if expected_metadata != (stored_object.object_key, stored_object.mime_type):

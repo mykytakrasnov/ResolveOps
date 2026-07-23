@@ -516,3 +516,12 @@ class RunArtifact(ContractModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     size_bytes: int = Field(ge=0)
     created_at: AwareDatetime
+
+
+class InternalTraceIdentifiers(ContractModel):
+    """Private correlation identifiers included only in authenticated reports."""
+
+    workflow_run_id: UUID
+    langgraph_thread_id: str = Field(min_length=1, max_length=255)
+    langfuse_trace_id: str | None = Field(default=None, min_length=1, max_length=255)
+    aws_request_id: str | None = Field(default=None, min_length=1, max_length=255)

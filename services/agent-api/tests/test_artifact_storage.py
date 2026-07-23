@@ -24,6 +24,10 @@ def test_local_object_storage_writes_bounded_content_and_returns_integrity_metad
     assert stored.sha256 == hashlib.sha256(content).hexdigest()
     assert stored.size_bytes == len(content)
     assert stored.mime_type == "application/json"
+    retrieved = storage.get_object(object_key=stored.object_key)
+    assert retrieved is not None
+    assert retrieved.content == content
+    assert retrieved.sha256 == stored.sha256
 
 
 @pytest.mark.parametrize(

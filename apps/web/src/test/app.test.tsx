@@ -151,6 +151,43 @@ function approvalItem(decision: "approve" | "reject" | null = null) {
   };
 }
 
+function reportMetadata() {
+  return {
+    run_id: RUN_ID,
+    status: "completed",
+    internal_trace_identifiers: {
+      workflow_run_id: RUN_ID,
+      langgraph_thread_id: RUN_ID,
+    },
+    artifacts: [
+      {
+        kind: "json_report",
+        mime_type: "application/json",
+        sha256: "c".repeat(64),
+        size_bytes: 512,
+        download_url: `/api/v1/runs/${RUN_ID}/report/json_report`,
+        created_at: "2026-07-22T12:00:04Z",
+      },
+      {
+        kind: "markdown_brief",
+        mime_type: "text/markdown; charset=utf-8",
+        sha256: "d".repeat(64),
+        size_bytes: 256,
+        download_url: `/api/v1/runs/${RUN_ID}/report/markdown_brief`,
+        created_at: "2026-07-22T12:00:04Z",
+      },
+      {
+        kind: "customer_response",
+        mime_type: "text/plain; charset=utf-8",
+        sha256: "e".repeat(64),
+        size_bytes: 128,
+        download_url: `/api/v1/runs/${RUN_ID}/report/customer_response`,
+        created_at: "2026-07-22T12:00:04Z",
+      },
+    ],
+  };
+}
+
 function jsonResponse(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
     status,
@@ -302,6 +339,66 @@ describe("case workflow surface", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(supportCase.body)).toBeInTheDocument();
     expect(screen.getByText("Approval expected")).toBeInTheDocument();
+  });
+
+  test("replay gallery opens a prerecorded timeline through public static endpoints", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/api/v1/public/replays?")) {
+          return jsonResponse({
+            items: [supportCase],
+            page: { limit: 50, next_cursor: null },
+          });
+        }
+        if (url.endsWith(`/api/v1/public/replays/${CASE_ID}`)) {
+          return jsonResponse({
+            case: supportCase,
+            events: [completionEvent()],
+          });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    renderRoute("/replays");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "View replay" }),
+    );
+
+    expect(await screen.findByText("Prerecorded replay")).toBeInTheDocument();
+    expect(
+      screen.getByText("Synthetic investigation completed."),
+    ).toBeInTheDocument();
+  });
+
+  test("completed run offers authenticated report downloads with integrity metadata", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith(`/runs/${RUN_ID}`)) {
+          return jsonResponse(workflowRun());
+        }
+        if (url.endsWith(`/runs/${RUN_ID}/report`)) {
+          return jsonResponse(reportMetadata());
+        }
+        if (url.endsWith(`/cases/${CASE_ID}`)) return jsonResponse(supportCase);
+        if (url.includes(`/runs/${RUN_ID}/events`)) {
+          return jsonResponse(eventPage([completionEvent()]));
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    renderRoute(`/app/runs/${RUN_ID}`);
+
+    expect(await screen.findByText("Report downloads")).toBeInTheDocument();
+    expect(await screen.findByText("JSON report")).toBeInTheDocument();
+    expect(screen.getByText("Markdown case brief")).toBeInTheDocument();
+    expect(screen.getByText("Customer response")).toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: /^Download / })).toHaveLength(3);
+    expect(screen.getByText(`SHA-256 ${"c".repeat(64)}`)).toBeInTheDocument();
   });
 
   test("starting an investigation creates a run and navigates to its page", async () => {

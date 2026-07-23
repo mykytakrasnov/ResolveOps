@@ -12,6 +12,23 @@ export interface PublicCase {
   attachments: readonly Record<string, string>[];
 }
 
+export interface PublicReplayEvent {
+  event_id: number;
+  run_id: string;
+  sequence: number;
+  event_type: string;
+  node_name: string | null;
+  status: string;
+  public_payload: Readonly<{ case_id: string; summary: string }>;
+  payload_hash: string;
+  created_at: string;
+}
+
+export interface PublicReplay {
+  case: PublicCase;
+  events: readonly PublicReplayEvent[];
+}
+
 export interface CrmAccount {
   account_id: string;
   customer_reference: string;

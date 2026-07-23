@@ -27,6 +27,7 @@ import { ApprovalBadge, CategoryBadge } from "../cases/case-ui";
 import { ApprovalCard } from "./approval-card";
 import { RunTimeline } from "./run-timeline";
 import { formatDuration } from "./run-utils";
+import { ReportDownloads } from "./report-downloads";
 import { useRunTimeline } from "./use-run-timeline";
 
 function useElapsed(startedAt?: string | null, completedAt?: string | null) {
@@ -266,6 +267,9 @@ export function RunPage() {
               </dl>
             </CardContent>
           </Card>
+          {run?.status === "completed" || run?.status === "escalated" ? (
+            <ReportDownloads runId={runId} />
+          ) : null}
         </aside>
       </div>
     </div>

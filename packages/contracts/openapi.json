@@ -892,6 +892,57 @@
         "title": "FinalResponse",
         "type": "object"
       },
+      "InternalTraceIdentifiers": {
+        "additionalProperties": false,
+        "description": "Private correlation identifiers included only in authenticated reports.",
+        "properties": {
+          "aws_request_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Aws Request Id"
+          },
+          "langfuse_trace_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Langfuse Trace Id"
+          },
+          "langgraph_thread_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Langgraph Thread Id",
+            "type": "string"
+          },
+          "workflow_run_id": {
+            "format": "uuid",
+            "title": "Workflow Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_run_id",
+          "langgraph_thread_id"
+        ],
+        "title": "InternalTraceIdentifiers",
+        "type": "object"
+      },
       "InvestigationPlan": {
         "additionalProperties": false,
         "description": "Deterministically selected allowlisted evidence recipe.",
@@ -1051,6 +1102,50 @@
         ],
         "title": "ReadToolName",
         "type": "string"
+      },
+      "ReportArtifactAccess": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "download_url": {
+            "pattern": "^/api/v1/runs/[0-9a-f-]+/report/[a-z_]+$",
+            "title": "Download Url",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ArtifactKind"
+          },
+          "mime_type": {
+            "maxLength": 127,
+            "minLength": 1,
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "mime_type",
+          "sha256",
+          "size_bytes",
+          "download_url",
+          "created_at"
+        ],
+        "title": "ReportArtifactAccess",
+        "type": "object"
       },
       "RequestedToolCall": {
         "additionalProperties": false,
@@ -1271,6 +1366,37 @@
           "recoverable"
         ],
         "title": "RunError",
+        "type": "object"
+      },
+      "RunReportResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ReportArtifactAccess"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "internal_trace_identifiers": {
+            "$ref": "#/components/schemas/InternalTraceIdentifiers"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStatus"
+          }
+        },
+        "required": [
+          "run_id",
+          "status",
+          "internal_trace_identifiers",
+          "artifacts"
+        ],
+        "title": "RunReportResponse",
         "type": "object"
       },
       "RunStatus": {

@@ -109,6 +109,37 @@ export const workflowEventPageSchema = z.object({
   last_sequence: z.number().int().nonnegative(),
 });
 
+export const publicReplaySchema = z.object({
+  case: publicCaseSchema,
+  events: z.array(workflowEventSchema),
+});
+
+export const reportArtifactAccessSchema = z.object({
+  kind: z.enum([
+    "json_report",
+    "markdown_brief",
+    "customer_response",
+    "public_events",
+  ]),
+  mime_type: z.string(),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  size_bytes: z.number().int().nonnegative(),
+  download_url: z.string(),
+  created_at: z.iso.datetime({ offset: true }),
+});
+
+export const runReportSchema = z.object({
+  run_id: z.uuid(),
+  status: runStatusSchema,
+  internal_trace_identifiers: z.object({
+    workflow_run_id: z.uuid(),
+    langgraph_thread_id: z.string(),
+    langfuse_trace_id: z.string().nullable().optional(),
+    aws_request_id: z.string().nullable().optional(),
+  }),
+  artifacts: z.array(reportArtifactAccessSchema),
+});
+
 export const createRunResponseSchema = z.object({
   run_id: z.uuid(),
   status: runStatusSchema,
@@ -187,5 +218,7 @@ export type PublicCase = z.infer<typeof publicCaseSchema>;
 export type WorkflowRun = z.infer<typeof workflowRunSchema>;
 export type WorkflowEvent = z.infer<typeof workflowEventSchema>;
 export type WorkflowEventType = z.infer<typeof workflowEventTypeSchema>;
+export type PublicReplay = z.infer<typeof publicReplaySchema>;
+export type RunReport = z.infer<typeof runReportSchema>;
 export type RunStatus = z.infer<typeof runStatusSchema>;
 export type ApprovalQueueItem = z.infer<typeof approvalQueueItemSchema>;

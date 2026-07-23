@@ -43,6 +43,8 @@ export function localSyntheticApiPlugin(
         const isSyntheticRoute =
           url.pathname === "/api/v1/cases" ||
           url.pathname.startsWith("/api/v1/cases/") ||
+          url.pathname === "/api/v1/public/replays" ||
+          url.pathname.startsWith("/api/v1/public/replays/") ||
           url.pathname === "/systems/v1" ||
           url.pathname.startsWith("/systems/v1/");
         if (!isSyntheticRoute) {

@@ -1,4 +1,8 @@
-import { ShieldCheckIcon, TrayIcon } from "@phosphor-icons/react";
+import {
+  FilmStripIcon,
+  ShieldCheckIcon,
+  TrayIcon,
+} from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { useLocation } from "react-router";
 
@@ -18,6 +22,7 @@ import {
 const navigation = [
   { label: "Cases", href: "/app/cases", icon: TrayIcon },
   { label: "Review", href: "/app/review", icon: ShieldCheckIcon },
+  { label: "Replays", href: "/replays", icon: FilmStripIcon },
 ];
 
 export function AppShell({ children }: { children: ReactNode }) {

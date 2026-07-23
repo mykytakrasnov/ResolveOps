@@ -988,6 +988,48 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
         assert replay.headers["Idempotent-Replay"] == "true"
         assert [line for line in replay.text.splitlines() if line.startswith("id: ")] == event_ids
 
+        report_response = client.get(f"/api/v1/runs/{run_id}/report")
+        assert report_response.status_code == 200
+        report = report_response.json()
+        assert report["internal_trace_identifiers"]["workflow_run_id"] == run_id
+        assert {artifact["kind"] for artifact in report["artifacts"]} == {
+            "json_report",
+            "markdown_brief",
+            "customer_response",
+            "public_events",
+        }
+        json_metadata = next(
+            artifact for artifact in report["artifacts"] if artifact["kind"] == "json_report"
+        )
+        download = client.get(json_metadata["download_url"])
+        assert download.status_code == 200
+        assert download.headers["cache-control"] == "private, no-store"
+        assert download.headers["x-content-sha256"] == json_metadata["sha256"]
+        assert hashlib.sha256(download.content).hexdigest() == json_metadata["sha256"]
+
+    other_operator = Principal(
+        organization_id=seeded_case.principal.organization_id,
+        user_id=uuid4(),
+        roles=frozenset({"operator"}),
+    )
+    with _client(database_url, other_operator) as other_client:
+        private_download = other_client.get(
+            f"/api/v1/runs/{run_id}/report/{ArtifactKind.JSON_REPORT.value}"
+        )
+        assert private_download.status_code == 404
+    other_reviewer = Principal(
+        organization_id=seeded_case.principal.organization_id,
+        user_id=uuid4(),
+        roles=frozenset({"reviewer"}),
+    )
+    with _client(database_url, other_reviewer) as reviewer_client:
+        private_metadata = reviewer_client.get(f"/api/v1/runs/{run_id}/report")
+        private_download = reviewer_client.get(
+            f"/api/v1/runs/{run_id}/report/{ArtifactKind.JSON_REPORT.value}"
+        )
+        assert private_metadata.status_code == 404
+        assert private_download.status_code == 404
+
     with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
         cursor.execute(
             """
@@ -1020,8 +1062,13 @@ def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
     assert all(str(attempt[0]).startswith("execution-1:") for attempt in tool_attempts)
     assert all(attempt[2] == "completed" for attempt in tool_attempts)
     assert all("body" not in attempt[3] and "body" not in attempt[4] for attempt in tool_attempts)
-    assert {artifact[0] for artifact in artifacts} == {"json_report", "markdown_brief"}
-    assert all(str(artifact[1]).startswith(f"runs/{run_id}/report.") for artifact in artifacts)
+    assert {artifact[0] for artifact in artifacts} == {
+        "json_report",
+        "markdown_brief",
+        "customer_response",
+        "public_events",
+    }
+    assert all(str(artifact[1]).startswith(f"runs/{run_id}/") for artifact in artifacts)
     assert all(len(artifact[3]) == 64 and artifact[4] > 0 for artifact in artifacts)
 
 

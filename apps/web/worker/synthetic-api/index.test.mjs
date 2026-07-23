@@ -45,6 +45,21 @@ function fixtureObjects() {
       resolution_code: "must_never_be_returned",
       expected_evidence_ids: ["secret"],
     }),
+    [`synthetic/v1/replays/${CASE_ID}/events.jsonl`]: `${JSON.stringify({
+      event_id: 1,
+      run_id: "88888888-8888-5888-8888-888888888888",
+      sequence: 1,
+      event_type: "run.completed",
+      node_name: null,
+      status: "completed",
+      public_payload: {
+        case_id: CASE_ID,
+        summary: "Synthetic investigation completed.",
+      },
+      payload_hash: "a".repeat(64),
+      created_at: "2026-07-22T12:00:00Z",
+      langfuse_trace_id: "must-never-cross-the-public-boundary",
+    })}\n`,
     [`synthetic/v1/crm/accounts/${ACCOUNT_ID}.json`]: JSON.stringify({
       account_id: ACCOUNT_ID,
       customer_reference: "org_atlas_001",
@@ -183,6 +198,53 @@ test("public routes list curated cases and return a redacted case", async () => 
   assert.equal(detail.expected_approval_required, true);
   assert.equal(detail.resolution_code, undefined);
   assert.equal(detail.hidden_truth, undefined);
+});
+
+test("public replay routes use static sanitized artifacts without service authentication", async () => {
+  const api = createFixtureApi();
+  const listResponse = await api.fetch(
+    new Request("https://resolveops.example/api/v1/public/replays?limit=10"),
+  );
+  assert.equal(listResponse.status, 200);
+  const list = await listResponse.json();
+  assert.deepEqual(
+    list.items.map((item) => item.case_id),
+    [CASE_ID],
+  );
+
+  const detailResponse = await api.fetch(
+    new Request(`https://resolveops.example/api/v1/public/replays/${CASE_ID}`),
+  );
+  assert.equal(detailResponse.status, 200);
+  const detail = await detailResponse.json();
+  assert.equal(detail.case.case_id, CASE_ID);
+  assert.equal(detail.events[0].event_type, "run.completed");
+  assert.deepEqual(Object.keys(detail.events[0].public_payload).sort(), [
+    "case_id",
+    "summary",
+  ]);
+  assert.equal(detail.events[0].langfuse_trace_id, undefined);
+});
+
+test("public replay routes reject forbidden fields inside the public payload", async () => {
+  const objects = fixtureObjects();
+  const replayKey = `synthetic/v1/replays/${CASE_ID}/events.jsonl`;
+  const event = JSON.parse(objects[replayKey]);
+  event.public_payload.internal_trace_id =
+    "must-never-cross-the-public-boundary";
+  objects[replayKey] = `${JSON.stringify(event)}\n`;
+  const api = createSyntheticApi({
+    storage: new MemoryObjectStorage(objects),
+    hmacSecret: SECRET,
+    nonceStore: new InMemoryNonceStore(),
+    now: () => NOW,
+  });
+
+  const response = await api.fetch(
+    new Request(`https://resolveops.example/api/v1/public/replays/${CASE_ID}`),
+  );
+
+  assert.equal(response.status, 500);
 });
 
 test("local filesystem storage serves generated synthetic case routes", async () => {

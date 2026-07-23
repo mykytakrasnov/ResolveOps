@@ -274,6 +274,13 @@ export interface RunArtifact {
   created_at: string;
 }
 
+export interface InternalTraceIdentifiers {
+  workflow_run_id: string;
+  langgraph_thread_id: string;
+  langfuse_trace_id?: string | null;
+  aws_request_id?: string | null;
+}
+
 export interface ApprovalDecisionRequest {
   proposal_id: string;
   proposal_hash: string;
@@ -305,4 +312,20 @@ export interface ApprovalDecisionResponse {
   run_id: string;
   approval: ApprovalRequest;
   idempotent_replay: boolean;
+}
+
+export interface ReportArtifactAccess {
+  kind: ArtifactKind;
+  mime_type: string;
+  sha256: string;
+  size_bytes: number;
+  download_url: string;
+  created_at: string;
+}
+
+export interface RunReportResponse {
+  run_id: string;
+  status: RunStatus;
+  internal_trace_identifiers: InternalTraceIdentifiers;
+  artifacts: Array<ReportArtifactAccess>;
 }

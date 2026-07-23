@@ -66,6 +66,7 @@ from resolveops.tools.read_only import ReadOnlyToolset
 
 NOW = datetime(2026, 7, 22, 12, tzinfo=UTC)
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+CASE_ID = UUID("dddddddd-dddd-5ddd-8ddd-dddddddddddd")
 ORGANIZATION_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 ACCOUNT_ID = UUID("a2bf6866-a47b-5920-8ada-49d78c5d39f1")
 SUBSCRIPTION_ID = UUID("09615c4c-25ac-5d56-a6d1-6bbc4573e5e0")
@@ -319,6 +320,7 @@ class FakePersistence:
     def get_run_case(self, **kwargs: object) -> RunCase:
         del kwargs
         return RunCase(
+            case_id=CASE_ID,
             ticket=TicketInput(
                 subject="Charged twice after plan upgrade",
                 body="We upgraded yesterday and see two completed charges for the same period.",
@@ -362,6 +364,10 @@ class FailingObjectStorage:
     def put_object(self, **kwargs: object) -> StoredObject:
         del kwargs
         raise RuntimeError("synthetic artifact write failure")
+
+    def get_object(self, **kwargs: object) -> Any:
+        del kwargs
+        raise RuntimeError("synthetic artifact read failure")
 
 
 class DeterministicFakeModel:
@@ -502,6 +508,7 @@ def invoke_graph(
     )
     initial: DuplicateChargeState = {
         "run_id": RUN_ID,
+        "case_id": CASE_ID,
         "organization_id": ORGANIZATION_ID,
         "ticket": TicketInput(
             subject="Charged twice after plan upgrade",
@@ -618,6 +625,7 @@ def test_duplicate_charge_graph_collects_required_typed_evidence_and_public_even
 
     initial: DuplicateChargeState = {
         "run_id": RUN_ID,
+        "case_id": CASE_ID,
         "organization_id": ORGANIZATION_ID,
         "ticket": TicketInput(
             subject="Charged twice after plan upgrade",
@@ -735,6 +743,8 @@ def test_missing_policy_evidence_routes_to_escalation() -> None:
     assert {artifact.kind for artifact in persistence.artifacts} == {
         ArtifactKind.JSON_REPORT,
         ArtifactKind.MARKDOWN_BRIEF,
+        ArtifactKind.CUSTOMER_RESPONSE,
+        ArtifactKind.PUBLIC_EVENTS,
     }
     assert any(event.event_type is WorkflowEventType.MODEL_FALLBACK for event in persistence.events)
 
@@ -749,6 +759,8 @@ def test_total_tool_outage_escalates_with_a_cited_case_report() -> None:
     assert {artifact.kind for artifact in persistence.artifacts} == {
         ArtifactKind.JSON_REPORT,
         ArtifactKind.MARKDOWN_BRIEF,
+        ArtifactKind.CUSTOMER_RESPONSE,
+        ArtifactKind.PUBLIC_EVENTS,
     }
 
 
@@ -769,13 +781,29 @@ def test_complete_non_duplicate_evidence_routes_to_no_action() -> None:
     report = json.loads(json_object.content)
     assert report["workflow_outcome"] == "no_action"
     assert report["final_response"]["cited_evidence_ids"]
+    assert report["internal_trace_identifiers"] == {
+        "workflow_run_id": str(RUN_ID),
+        "langgraph_thread_id": str(RUN_ID),
+    }
     markdown = persistence.storage.objects[f"runs/{RUN_ID}/report.md"].content.decode()
     assert "## Customer response" in markdown
     assert "## Evidence citations" in markdown
     assert {artifact.kind for artifact in persistence.artifacts} == {
         ArtifactKind.JSON_REPORT,
         ArtifactKind.MARKDOWN_BRIEF,
+        ArtifactKind.CUSTOMER_RESPONSE,
+        ArtifactKind.PUBLIC_EVENTS,
     }
+    public_events = persistence.storage.objects[f"runs/{RUN_ID}/events.jsonl"].content.decode()
+    assert "langgraph_thread_id" not in public_events
+    assert "internal_trace_identifiers" not in public_events
+    public_rows = [json.loads(line) for line in public_events.splitlines()]
+    assert all(WorkflowEvent.model_validate(row) for row in public_rows)
+    assert all(row["public_payload"]["case_id"] == str(CASE_ID) for row in public_rows)
+    assert all(set(row["public_payload"]) == {"case_id", "summary"} for row in public_rows)
+    public_sequences = [row["sequence"] for row in public_rows]
+    assert public_sequences == sorted(set(public_sequences))
+    assert public_rows[-1]["event_type"] == WorkflowEventType.RUN_COMPLETED.value
     for artifact in persistence.artifacts:
         stored = persistence.storage.objects[artifact.object_key]
         assert artifact.sha256 == stored.sha256

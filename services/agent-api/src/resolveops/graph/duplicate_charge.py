@@ -32,6 +32,7 @@ from resolveops.models.contracts import (
     EvidenceItem,
     EvidenceVerification,
     FinalResponse,
+    InternalTraceIdentifiers,
     InvestigationPlan,
     PolicyDecision,
     ReadToolName,
@@ -39,6 +40,7 @@ from resolveops.models.contracts import (
     RiskIndicator,
     RiskLevel,
     RunArtifact,
+    RunStatus,
     SourceSystem,
     TicketInput,
     ToolResult,
@@ -504,6 +506,7 @@ def execute_duplicate_charge_graph(
     object_storage: ObjectStorage,
     lease: ExecutionLease,
     organization_id: UUID,
+    case_id: UUID,
     ticket: TicketInput,
     case_created_at: datetime,
     model_gateway: ModelGateway | None = None,
@@ -518,7 +521,12 @@ def execute_duplicate_charge_graph(
     )
     initial: DuplicateChargeState = {
         "run_id": lease.run_id,
+        "case_id": case_id,
         "organization_id": organization_id,
+        "internal_trace_identifiers": InternalTraceIdentifiers(
+            workflow_run_id=lease.run_id,
+            langgraph_thread_id=str(lease.run_id),
+        ),
         "ticket": ticket,
         "case_created_at": case_created_at.isoformat(),
         "evidence": [],
@@ -552,6 +560,7 @@ async def execute_checkpointed_duplicate_charge_graph(
     object_storage: ObjectStorage,
     lease: ExecutionLease,
     organization_id: UUID,
+    case_id: UUID,
     ticket: TicketInput,
     case_created_at: datetime,
     checkpoint_dsn: str,
@@ -561,7 +570,12 @@ async def execute_checkpointed_duplicate_charge_graph(
 
     initial: DuplicateChargeState = {
         "run_id": lease.run_id,
+        "case_id": case_id,
         "organization_id": organization_id,
+        "internal_trace_identifiers": InternalTraceIdentifiers(
+            workflow_run_id=lease.run_id,
+            langgraph_thread_id=str(lease.run_id),
+        ),
         "ticket": ticket,
         "case_created_at": case_created_at.isoformat(),
         "evidence": [],
@@ -1680,6 +1694,11 @@ def _finalize_node(
             json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
         ).encode()
         markdown_content = _markdown_report(state).encode()
+        customer_response_content = _customer_response_report(state).encode()
+        public_events_content = _public_event_summary(
+            state,
+            terminal_created_at=started.created_at.isoformat(),
+        ).encode()
         stored_objects = (
             (
                 ArtifactKind.JSON_REPORT,
@@ -1695,6 +1714,22 @@ def _finalize_node(
                     object_key=f"runs/{lease.run_id}/report.md",
                     content=markdown_content,
                     mime_type="text/markdown; charset=utf-8",
+                ),
+            ),
+            (
+                ArtifactKind.CUSTOMER_RESPONSE,
+                object_storage.put_object(
+                    object_key=f"runs/{lease.run_id}/customer-response.txt",
+                    content=customer_response_content,
+                    mime_type="text/plain; charset=utf-8",
+                ),
+            ),
+            (
+                ArtifactKind.PUBLIC_EVENTS,
+                object_storage.put_object(
+                    object_key=f"runs/{lease.run_id}/events.jsonl",
+                    content=public_events_content,
+                    mime_type="application/x-ndjson",
                 ),
             ),
         )
@@ -1714,7 +1749,7 @@ def _finalize_node(
             node_name=FINALIZE_RUN,
             status="completed",
             public_payload={
-                "summary": "Structured JSON and Markdown reports were finalized.",
+                "summary": "Private reports and a sanitized public event summary were finalized.",
                 "artifact_kinds": cast(JsonValue, [artifact.kind.value for artifact in artifacts]),
             },
         )
@@ -1724,9 +1759,22 @@ def _finalize_node(
 
 
 def _structured_report(state: DuplicateChargeState) -> dict[str, JsonValue]:
+    internal_trace_identifiers = InternalTraceIdentifiers.model_validate(
+        state.get(
+            "internal_trace_identifiers",
+            {
+                "workflow_run_id": state["run_id"],
+                "langgraph_thread_id": str(state["run_id"]),
+            },
+        )
+    )
     return {
         "schema_version": "1.0",
         "run_id": str(state["run_id"]),
+        "internal_trace_identifiers": cast(
+            JsonValue,
+            internal_trace_identifiers.model_dump(mode="json", exclude_none=True),
+        ),
         "workflow_outcome": state["workflow_outcome"].value,
         "reason_code": state.get("workflow_reason_code", state["policy_decision"].reason_code),
         "final_response": cast(JsonValue, state["final_response"].model_dump(mode="json")),
@@ -1776,6 +1824,86 @@ def _markdown_report(state: DuplicateChargeState) -> str:
         f"{response.uncertainty_disclosure}\n\n"
         "## Evidence citations\n\n"
         f"{citations}\n"
+    )
+
+
+def _customer_response_report(state: DuplicateChargeState) -> str:
+    response = state["final_response"]
+    return f"{response.subject}\n\n{response.body}\n"
+
+
+def _public_event_summary(
+    state: DuplicateChargeState,
+    *,
+    terminal_created_at: str,
+) -> str:
+    rows: list[dict[str, JsonValue]] = []
+    case_id = str(state["case_id"])
+    run_id = str(state["run_id"])
+    source_events = sorted(state.get("emitted_events", []), key=lambda event: event.sequence)
+    for sequence, event in enumerate(source_events, start=1):
+        summary = event.public_payload.get("summary")
+        public_payload: dict[str, JsonValue] = {
+            "case_id": case_id,
+            "summary": summary if isinstance(summary, str) else event.event_type.value,
+        }
+        rows.append(
+            {
+                "event_id": sequence,
+                "run_id": run_id,
+                "sequence": sequence,
+                "event_type": event.event_type.value,
+                "node_name": event.node_name,
+                "status": event.status,
+                "public_payload": public_payload,
+                "payload_hash": hashlib.sha256(
+                    json.dumps(
+                        public_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ).encode()
+                ).hexdigest(),
+                "created_at": event.created_at.isoformat(),
+            }
+        )
+    terminal_type = (
+        WorkflowEventType.RUN_ESCALATED
+        if state["workflow_outcome"] is WorkflowOutcome.ESCALATE
+        else WorkflowEventType.RUN_COMPLETED
+    )
+    terminal_sequence = len(rows) + 1
+    terminal_payload: dict[str, JsonValue] = {
+        "case_id": case_id,
+        "summary": "Synthetic investigation reached its recorded terminal outcome.",
+    }
+    rows.append(
+        {
+            "event_id": terminal_sequence,
+            "run_id": run_id,
+            "sequence": terminal_sequence,
+            "event_type": terminal_type.value,
+            "node_name": None,
+            "status": (
+                RunStatus.ESCALATED.value
+                if terminal_type is WorkflowEventType.RUN_ESCALATED
+                else RunStatus.COMPLETED.value
+            ),
+            "public_payload": terminal_payload,
+            "payload_hash": hashlib.sha256(
+                json.dumps(
+                    terminal_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode()
+            ).hexdigest(),
+            "created_at": terminal_created_at,
+        }
+    )
+    return "".join(
+        f"{json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=True)}\n"
+        for row in rows
     )
 
 

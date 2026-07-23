@@ -23,6 +23,7 @@ from resolveops.graph.duplicate_charge import (
 )
 from resolveops.models.contracts import (
     ApprovalDecisionType,
+    ArtifactKind,
     RunStatus,
     WorkflowEvent,
     WorkflowEventType,
@@ -37,6 +38,8 @@ from resolveops.models.run_api import (
     ApprovalQueuePage,
     CreateRunRequest,
     CreateRunResponse,
+    ReportArtifactAccess,
+    RunReportResponse,
     WorkflowEventPage,
 )
 from resolveops.repositories.runs import (
@@ -47,6 +50,7 @@ from resolveops.repositories.runs import (
     ExecutionLeaseConflictError,
     IdempotencyConflictError,
     LostExecutionLeaseError,
+    ReportNotReadyError,
     RunNotExecutableError,
     RunNotFoundError,
     StaleProposalError,
@@ -203,6 +207,97 @@ def get_run(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
     response.headers["Cache-Control"] = "no-store"
     return run
+
+
+@router.get("/{run_id}/report", response_model=RunReportResponse)
+def get_report(
+    run_id: UUID,
+    principal: PrincipalDependency,
+    repository: RepositoryDependency,
+    response: Response,
+) -> RunReportResponse:
+    try:
+        report = repository.get_report(
+            run_id=run_id,
+            organization_id=principal.organization_id,
+            actor_user_id=principal.user_id,
+            allow_all=principal.can_access_all_runs,
+        )
+    except RunNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except ReportNotReadyError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+    response.headers["Cache-Control"] = "no-store"
+    return RunReportResponse(
+        run_id=run_id,
+        status=report.status,
+        internal_trace_identifiers=report.internal_trace_identifiers,
+        artifacts=[
+            ReportArtifactAccess(
+                kind=artifact.kind,
+                mime_type=artifact.mime_type,
+                sha256=artifact.sha256,
+                size_bytes=artifact.size_bytes,
+                download_url=f"/api/v1/runs/{run_id}/report/{artifact.kind.value}",
+                created_at=artifact.created_at,
+            )
+            for artifact in report.artifacts
+        ],
+    )
+
+
+@router.get("/{run_id}/report/{kind}")
+def download_report_artifact(
+    run_id: UUID,
+    kind: ArtifactKind,
+    request: Request,
+    principal: PrincipalDependency,
+    repository: RepositoryDependency,
+) -> Response:
+    object_storage = getattr(request.app.state, "object_storage", None)
+    if not isinstance(object_storage, ObjectStorage):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="run artifact storage is unavailable",
+        )
+    try:
+        artifact = repository.get_report_artifact(
+            run_id=run_id,
+            organization_id=principal.organization_id,
+            actor_user_id=principal.user_id,
+            kind=kind,
+            allow_all=principal.can_access_all_runs,
+        )
+    except RunNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except ReportNotReadyError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+    stored = object_storage.get_object(object_key=artifact.object_key)
+    if (
+        stored is None
+        or stored.sha256 != artifact.sha256
+        or stored.size_bytes != artifact.size_bytes
+        or stored.mime_type != artifact.mime_type
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="run artifact failed its integrity check",
+        )
+    filename = {
+        ArtifactKind.JSON_REPORT: "resolveops-report.json",
+        ArtifactKind.MARKDOWN_BRIEF: "resolveops-case-brief.md",
+        ArtifactKind.CUSTOMER_RESPONSE: "resolveops-customer-response.txt",
+        ArtifactKind.PUBLIC_EVENTS: "resolveops-public-events.jsonl",
+    }[kind]
+    return Response(
+        content=stored.content,
+        media_type=stored.mime_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-SHA256": stored.sha256,
+        },
+    )
 
 
 @router.get("/{run_id}/approval", response_model=ApprovalQueueItem)
@@ -552,6 +647,7 @@ def _execute_shell(
                 object_storage=object_storage,
                 lease=lease,
                 organization_id=principal.organization_id,
+                case_id=run_case.case_id,
                 ticket=run_case.ticket,
                 case_created_at=run_case.created_at,
                 model_gateway=model_gateway,
@@ -570,6 +666,7 @@ def _execute_shell(
                     object_storage=object_storage,
                     lease=lease,
                     organization_id=principal.organization_id,
+                    case_id=run_case.case_id,
                     ticket=run_case.ticket,
                     case_created_at=run_case.created_at,
                     checkpoint_dsn=checkpoint_dsn,

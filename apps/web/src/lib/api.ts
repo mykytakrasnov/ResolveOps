@@ -7,6 +7,8 @@ import {
   createRunResponseSchema,
   publicCasePageSchema,
   publicCaseSchema,
+  publicReplaySchema,
+  runReportSchema,
   workflowEventPageSchema,
   workflowEventSchema,
   workflowRunSchema,
@@ -78,6 +80,17 @@ export function getCase(caseId: string) {
   );
 }
 
+export function listPublicReplays() {
+  return requestJson("/api/v1/public/replays?limit=50", publicCasePageSchema);
+}
+
+export function getPublicReplay(caseId: string) {
+  return requestJson(
+    `/api/v1/public/replays/${encodeURIComponent(caseId)}`,
+    publicReplaySchema,
+  );
+}
+
 export function createRun(caseId: string) {
   return requestJson("/api/v1/runs", createRunResponseSchema, {
     method: "POST",
@@ -94,6 +107,13 @@ export function getRun(runId: string, signal?: AbortSignal) {
     `/api/v1/runs/${encodeURIComponent(runId)}`,
     workflowRunSchema,
     signal ? { signal } : undefined,
+  );
+}
+
+export function getRunReport(runId: string) {
+  return requestJson(
+    `/api/v1/runs/${encodeURIComponent(runId)}/report`,
+    runReportSchema,
   );
 }
 

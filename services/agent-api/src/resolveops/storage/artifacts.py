@@ -12,11 +12,13 @@ from uuid import UUID, uuid4
 MAX_ARTIFACT_BYTES = 1024 * 1024
 _OBJECT_KEY = re.compile(
     r"^runs/(?P<run_id>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/"
-    r"report\.(?P<extension>json|md)$"
+    r"(?P<name>report\.json|report\.md|customer-response\.txt|events\.jsonl)$"
 )
-_MIME_BY_EXTENSION = {
-    "json": "application/json",
-    "md": "text/markdown; charset=utf-8",
+_MIME_BY_NAME = {
+    "report.json": "application/json",
+    "report.md": "text/markdown; charset=utf-8",
+    "customer-response.txt": "text/plain; charset=utf-8",
+    "events.jsonl": "application/x-ndjson",
 }
 
 
@@ -38,9 +40,20 @@ class ObjectStorage(Protocol):
         mime_type: str,
     ) -> StoredObject: ...
 
+    def get_object(self, *, object_key: str) -> RetrievedObject | None: ...
+
 
 @dataclass(frozen=True)
 class InMemoryObject:
+    content: bytes
+    object_key: str
+    mime_type: str
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class RetrievedObject:
     content: bytes
     object_key: str
     mime_type: str
@@ -58,7 +71,7 @@ def _validate_object(
     if match is None:
         raise ValueError("object key must identify an allowlisted run report")
     UUID(match.group("run_id"))
-    expected_mime = _MIME_BY_EXTENSION[match.group("extension")]
+    expected_mime = _MIME_BY_NAME[match.group("name")]
     if mime_type != expected_mime:
         raise ValueError("object MIME type does not match the allowlisted report kind")
     if len(content) > MAX_ARTIFACT_BYTES:
@@ -106,6 +119,21 @@ class LocalObjectStorage:
             temporary.unlink(missing_ok=True)
         return stored
 
+    def get_object(self, *, object_key: str) -> RetrievedObject | None:
+        mime_type = _mime_type_for_key(object_key)
+        destination = (self._root / object_key).resolve()
+        if not destination.is_relative_to(self._root):
+            raise ValueError("object key resolves outside the storage root")
+        if not destination.is_file():
+            return None
+        content = destination.read_bytes()
+        stored = _validate_object(
+            object_key=object_key,
+            content=content,
+            mime_type=mime_type,
+        )
+        return RetrievedObject(content=content, **stored.__dict__)
+
 
 class InMemoryObjectStorage:
     """Deterministic test double implementing the same bounded object rules."""
@@ -127,3 +155,22 @@ class InMemoryObjectStorage:
         )
         self.objects[object_key] = InMemoryObject(content=content, **stored.__dict__)
         return stored
+
+    def get_object(self, *, object_key: str) -> RetrievedObject | None:
+        mime_type = _mime_type_for_key(object_key)
+        stored = self.objects.get(object_key)
+        if stored is None:
+            return None
+        validated = _validate_object(
+            object_key=object_key,
+            content=stored.content,
+            mime_type=mime_type,
+        )
+        return RetrievedObject(content=stored.content, **validated.__dict__)
+
+
+def _mime_type_for_key(object_key: str) -> str:
+    match = _OBJECT_KEY.fullmatch(object_key)
+    if match is None:
+        raise ValueError("object key must identify an allowlisted run report")
+    return _MIME_BY_NAME[match.group("name")]

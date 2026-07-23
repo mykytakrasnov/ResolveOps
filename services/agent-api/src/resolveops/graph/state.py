@@ -15,6 +15,7 @@ from resolveops.models.contracts import (
     EvidenceItem,
     EvidenceVerification,
     FinalResponse,
+    InternalTraceIdentifiers,
     InvestigationPlan,
     PolicyDecision,
     ResolutionProposal,
@@ -27,6 +28,7 @@ from resolveops.models.contracts import (
 
 class DuplicateChargeState(TypedDict, total=False):
     run_id: UUID
+    case_id: UUID
     organization_id: UUID
     ticket: TicketInput
     case_created_at: str
@@ -50,3 +52,4 @@ class DuplicateChargeState(TypedDict, total=False):
     approval_decision: ApprovalDecisionType
     action_result: ActionResult
     emitted_events: Annotated[list[WorkflowEvent], add]
+    internal_trace_identifiers: InternalTraceIdentifiers

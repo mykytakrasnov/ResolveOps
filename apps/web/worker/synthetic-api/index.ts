@@ -18,6 +18,8 @@ import type {
   PaymentAttempt,
   PolicyDocument,
   PublicCase,
+  PublicReplay,
+  PublicReplayEvent,
   Subscription,
   SyntheticStatus,
 } from "./types.ts";
@@ -36,12 +38,15 @@ export type {
   PaymentAttempt,
   PolicyDocument,
   PublicCase,
+  PublicReplay,
+  PublicReplayEvent,
   Subscription,
   SyntheticStatus,
 } from "./types.ts";
 
 const DATASET_PREFIX = "synthetic/v1/";
 const PUBLIC_CASE_PREFIX = `${DATASET_PREFIX}cases/public/`;
+const PUBLIC_REPLAY_PREFIX = `${DATASET_PREFIX}replays/`;
 const CRM_ACCOUNT_PREFIX = `${DATASET_PREFIX}crm/accounts/`;
 const BILLING_ACCOUNT_PREFIX = `${DATASET_PREFIX}billing/accounts/`;
 const INVOICE_PREFIX = `${DATASET_PREFIX}billing/invoices/`;
@@ -272,6 +277,89 @@ function parsePublicCase(text: string): PublicCase {
     created_at: object.created_at as string,
     attachments,
   };
+}
+
+const PUBLIC_EVENT_TYPES = new Set([
+  "run.started",
+  "node.started",
+  "node.completed",
+  "tool.started",
+  "tool.completed",
+  "tool.failed",
+  "model.retry",
+  "model.fallback",
+  "evidence.added",
+  "evidence.verified",
+  "policy.evaluated",
+  "approval.requested",
+  "approval.decided",
+  "action.executed",
+  "run.escalated",
+  "run.completed",
+  "run.failed",
+]);
+
+function parseReplayEvents(text: string, caseId: string): PublicReplayEvent[] {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0 || lines.length > 500) {
+    throw new Error("Invalid public replay event count.");
+  }
+  return lines.map((line) => {
+    const object = parseJsonObject(line, "public replay event");
+    requireProperties(object, "public replay event", {
+      event_id: "number",
+      run_id: "string",
+      sequence: "number",
+      event_type: "string",
+      status: "string",
+      public_payload: "object",
+      payload_hash: "string",
+      created_at: "string",
+    });
+    requireInteger(object, "event_id", "public replay event", 1);
+    requireInteger(object, "sequence", "public replay event", 1);
+    requireUuid(object, "run_id", "public replay event");
+    requireIsoDate(object, "created_at", "public replay event");
+    if (
+      !PUBLIC_EVENT_TYPES.has(object.event_type as string) ||
+      !("node_name" in object) ||
+      (object.node_name !== null && typeof object.node_name !== "string") ||
+      !/^[0-9a-f]{64}$/.test(object.payload_hash as string)
+    ) {
+      throw new Error("Invalid public replay event metadata.");
+    }
+    const payload = object.public_payload;
+    if (
+      typeof payload !== "object" ||
+      payload === null ||
+      Array.isArray(payload)
+    ) {
+      throw new Error("Invalid public replay payload.");
+    }
+    const payloadEntries = Object.keys(payload);
+    const summary = (payload as Record<string, unknown>).summary;
+    if (
+      payloadEntries.some((key) => !["case_id", "summary"].includes(key)) ||
+      (payload as Record<string, unknown>).case_id !== caseId ||
+      typeof summary !== "string"
+    ) {
+      throw new Error("Public replay payload is not sanitized.");
+    }
+    return {
+      event_id: object.event_id as number,
+      run_id: object.run_id as string,
+      sequence: object.sequence as number,
+      event_type: object.event_type as string,
+      node_name: object.node_name as string | null,
+      status: object.status as string,
+      public_payload: {
+        case_id: caseId,
+        summary,
+      },
+      payload_hash: object.payload_hash as string,
+      created_at: object.created_at as string,
+    };
+  });
 }
 
 function parseCrmAccount(text: string): CrmAccount {
@@ -609,6 +697,62 @@ export function createSyntheticApi(options: ApiOptions): {
     return jsonResponse(supportCase);
   }
 
+  async function publicReplays(url: URL): Promise<Response> {
+    rejectUnknownParameters(url.searchParams, ["limit", "cursor"]);
+    const limit = boundedInteger(url.searchParams, "limit", 20, 1, 50);
+    const cursor = boundedInteger(
+      url.searchParams,
+      "cursor",
+      0,
+      0,
+      MAX_STORAGE_KEYS,
+    );
+    const keys = await options.storage.list(
+      PUBLIC_REPLAY_PREFIX,
+      MAX_STORAGE_KEYS,
+    );
+    const caseIds = keys
+      .map(
+        (key) =>
+          new RegExp(
+            `^${PUBLIC_REPLAY_PREFIX}(${UUID_PATTERN})/events\\.jsonl$`,
+          ).exec(key)?.[1],
+      )
+      .filter((caseId): caseId is string => caseId !== undefined)
+      .sort();
+    const cases = await Promise.all(
+      caseIds.map(async (caseId) => {
+        const value = await options.storage.get(
+          `${PUBLIC_CASE_PREFIX}${caseId}.json`,
+        );
+        return value === null ? null : parsePublicCase(value);
+      }),
+    );
+    return jsonResponse(
+      page(
+        cases.filter((item): item is PublicCase => item?.curated === true),
+        cursor,
+        limit,
+      ),
+    );
+  }
+
+  async function publicReplay(caseId: string, url: URL): Promise<Response> {
+    rejectUnknownParameters(url.searchParams, []);
+    const [caseValue, eventValue] = await Promise.all([
+      options.storage.get(`${PUBLIC_CASE_PREFIX}${caseId}.json`),
+      options.storage.get(`${PUBLIC_REPLAY_PREFIX}${caseId}/events.jsonl`),
+    ]);
+    if (caseValue === null || eventValue === null) notFound();
+    const supportCase = parsePublicCase(caseValue);
+    if (!supportCase.curated || supportCase.case_id !== caseId) notFound();
+    const replay: PublicReplay = {
+      case: supportCase,
+      events: parseReplayEvents(eventValue, caseId),
+    };
+    return jsonResponse(replay);
+  }
+
   async function crmAccount(
     accountId: string,
     url: URL,
@@ -854,6 +998,14 @@ export function createSyntheticApi(options: ApiOptions): {
       notFound();
     }
     return publicCase(caseId, new URL(context.req.url));
+  });
+  app.get("/api/v1/public/replays", (context) => {
+    return publicReplays(new URL(context.req.url));
+  });
+  app.get("/api/v1/public/replays/:caseId", (context) => {
+    const caseId = context.req.param("caseId");
+    if (!new RegExp(`^${UUID_PATTERN}$`).test(caseId)) notFound();
+    return publicReplay(caseId, new URL(context.req.url));
   });
   app.get("/systems/v1/crm/accounts/:accountId", (context) => {
     const accountId = context.req.param("accountId");

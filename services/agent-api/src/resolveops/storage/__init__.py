@@ -4,7 +4,14 @@ from resolveops.storage.artifacts import (
     InMemoryObjectStorage,
     LocalObjectStorage,
     ObjectStorage,
+    RetrievedObject,
     StoredObject,
 )
 
-__all__ = ["InMemoryObjectStorage", "LocalObjectStorage", "ObjectStorage", "StoredObject"]
+__all__ = [
+    "InMemoryObjectStorage",
+    "LocalObjectStorage",
+    "ObjectStorage",
+    "RetrievedObject",
+    "StoredObject",
+]

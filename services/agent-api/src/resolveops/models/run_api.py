@@ -7,7 +7,9 @@ from pydantic import AwareDatetime, Field, model_validator
 from resolveops.models.contracts import (
     ApprovalDecisionType,
     ApprovalRequest,
+    ArtifactKind,
     ContractModel,
+    InternalTraceIdentifiers,
     RunStatus,
     WorkflowEvent,
 )
@@ -69,3 +71,19 @@ class ApprovalDecisionResponse(ContractModel):
     run_id: UUID
     approval: ApprovalRequest
     idempotent_replay: bool
+
+
+class ReportArtifactAccess(ContractModel):
+    kind: ArtifactKind
+    mime_type: str = Field(min_length=1, max_length=127)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
+    download_url: str = Field(pattern=r"^/api/v1/runs/[0-9a-f-]+/report/[a-z_]+$")
+    created_at: AwareDatetime
+
+
+class RunReportResponse(ContractModel):
+    run_id: UUID
+    status: RunStatus
+    internal_trace_identifiers: InternalTraceIdentifiers
+    artifacts: list[ReportArtifactAccess]
