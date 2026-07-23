@@ -361,13 +361,14 @@ def _resume_decided_run(
             repository.append_event(
                 lease=lease,
                 organization_id=principal.organization_id,
-                event_type=WorkflowEventType.NODE_STARTED,
-                node_name="execute_approved_action",
-                status="awaiting_execution",
+                event_type=WorkflowEventType.RUN_COMPLETED,
+                status="completed",
                 public_payload={
-                    "summary": "Approved proposal is awaiting exactly-once execution.",
+                    "summary": "Approved synthetic account credit executed exactly once.",
+                    "report_status": "generated",
+                    "workflow_outcome": WorkflowOutcome.APPROVAL_REQUIRED.value,
                 },
-                final_status=RunStatus.WAITING_FOR_APPROVAL,
+                final_status=RunStatus.COMPLETED,
             )
         else:
             repository.append_event(

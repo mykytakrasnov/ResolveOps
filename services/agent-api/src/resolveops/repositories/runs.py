@@ -17,7 +17,10 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel, JsonValue
 
 from resolveops.models.contracts import (
+    ActionExecutionStatus,
     ActionProposal,
+    ActionResult,
+    ActionType,
     ApprovalDecision,
     ApprovalDecisionType,
     ApprovalRequest,
@@ -36,6 +39,12 @@ from resolveops.models.contracts import (
 )
 from resolveops.models.run_api import ApprovalEvidence, ApprovalQueueItem
 from resolveops.storage.artifacts import StoredObject
+from resolveops.tools.account_credit import (
+    AccountCreditInput,
+    AmbiguousAccountCreditError,
+    DatabaseAccountCreditTool,
+    DuplicateCaseCreditError,
+)
 
 GRAPH_VERSION = "1.0.0"
 PROMPT_BUNDLE_VERSION = "1.0.0"
@@ -85,6 +94,10 @@ class StaleProposalError(RunRepositoryError):
 
 
 class ApprovalDecisionConflictError(RunRepositoryError):
+    pass
+
+
+class ActionExecutionAuthorizationError(RunRepositoryError):
     pass
 
 
@@ -143,8 +156,14 @@ def _normalize_dsn(dsn: str) -> str:
 class DatabaseRunRepository:
     """Runs each state transition in a short PostgreSQL transaction."""
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        account_credit_tool: DatabaseAccountCreditTool | None = None,
+    ) -> None:
         self._dsn = _normalize_dsn(dsn)
+        self._account_credit_tool = account_credit_tool or DatabaseAccountCreditTool(dsn)
 
     def _connect(self) -> psycopg.Connection[dict[str, Any]]:
         return psycopg.connect(
@@ -321,6 +340,7 @@ class DatabaseRunRepository:
                 """
                 SELECT proposal.*, request.id AS request_id, request.requested_by,
                        request.requested_at, request.decided_by, request.decision,
+                       request.decision_proposal_hash,
                        request.comment, request.decided_at,
                        run.case_id, support.subject AS case_subject
                 FROM app.approval_requests AS request
@@ -350,6 +370,7 @@ class DatabaseRunRepository:
                 """
                 SELECT proposal.*, request.id AS request_id, request.requested_by,
                        request.requested_at, request.decided_by, request.decision,
+                       request.decision_proposal_hash,
                        request.comment, request.decided_at,
                        run.case_id, support.subject AS case_subject
                 FROM app.approval_requests AS request
@@ -472,6 +493,7 @@ class DatabaseRunRepository:
                 """
                 SELECT proposal.*, request.id AS request_id, request.requested_by,
                        request.requested_at, request.decided_by, request.decision,
+                       request.decision_proposal_hash,
                        request.comment, request.decided_at,
                        run.status AS run_status,
                        run.current_node AS run_current_node,
@@ -538,8 +560,7 @@ class DatabaseRunRepository:
                             "decided run could not reacquire its resume lease"
                         )
                 elif not (
-                    row["run_status"] == RunStatus.WAITING_FOR_APPROVAL.value
-                    and row["run_current_node"] == "execute_approved_action"
+                    row["run_status"] == RunStatus.COMPLETED.value
                     and decision is ApprovalDecisionType.APPROVE
                 ) and not (
                     row["run_status"] == RunStatus.ESCALATED.value
@@ -557,11 +578,18 @@ class DatabaseRunRepository:
             cursor.execute(
                 """
                 UPDATE app.approval_requests
-                SET decision = %s, comment = %s, decided_by = %s, decided_at = CURRENT_TIMESTAMP
+                SET decision = %s, comment = %s, decided_by = %s,
+                    decision_proposal_hash = %s, decided_at = CURRENT_TIMESTAMP
                 WHERE id = %s AND decision IS NULL
                 RETURNING *
                 """,
-                (decision.value, normalized_comment, reviewer_user_id, row["request_id"]),
+                (
+                    decision.value,
+                    normalized_comment,
+                    reviewer_user_id,
+                    proposal_hash,
+                    row["request_id"],
+                ),
             )
             request_row = cursor.fetchone()
             if request_row is None:
@@ -634,6 +662,207 @@ class DatabaseRunRepository:
                 idempotent_replay=False,
                 lease=lease,
             )
+
+    def execute_approved_action(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+    ) -> ActionResult:
+        """Verify an exact persisted approval and apply its synthetic credit once."""
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            self._lock_owned_lease(cursor, lease=lease, organization_id=organization_id)
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"execute-approved-action:{lease.run_id}",),
+            )
+            cursor.execute(
+                """
+                SELECT proposal.*, request.decision, request.decision_proposal_hash,
+                       run.case_id, run.organization_id
+                FROM app.action_proposals AS proposal
+                JOIN app.approval_requests AS request
+                  ON request.proposal_id = proposal.id
+                JOIN app.workflow_runs AS run ON run.id = proposal.run_id
+                WHERE proposal.run_id = %s AND run.organization_id = %s
+                FOR UPDATE OF proposal, request, run
+                """,
+                (lease.run_id, organization_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ActionExecutionAuthorizationError(
+                    "approved action proposal was not persisted for this run"
+                )
+
+            expected_hash = _sha256(
+                {
+                    "action_type": row["action_type"],
+                    "target_reference": row["target_reference"],
+                    "canonical_parameters": row["canonical_parameters"],
+                    "risk_level": row["risk_level"],
+                    "policy_key": row["policy_key"],
+                    "policy_version": row["policy_version"],
+                }
+            )
+            if (
+                row["decision"] != ApprovalDecisionType.APPROVE.value
+                or row["decision_proposal_hash"] != row["proposal_hash"]
+                or expected_hash != row["proposal_hash"]
+            ):
+                raise ActionExecutionAuthorizationError(
+                    "persisted approval does not match the current proposal hash and version"
+                )
+            if row["status"] not in (
+                ProposalStatus.APPROVED.value,
+                ProposalStatus.EXECUTED.value,
+            ):
+                raise ActionExecutionAuthorizationError(
+                    "the persisted proposal is not approved for execution"
+                )
+            if row["action_type"] != ActionType.APPLY_ACCOUNT_CREDIT.value:
+                raise ActionExecutionAuthorizationError("the approved action type is unsupported")
+
+            cursor.execute(
+                "SELECT * FROM app.executed_actions WHERE proposal_id = %s FOR UPDATE",
+                (row["id"],),
+            )
+            existing = cursor.fetchone()
+            if existing is not None and existing["status"] == ActionExecutionStatus.SUCCEEDED.value:
+                return _action_result_from_row(existing)
+
+            parameters = row["canonical_parameters"]
+            account_id = parameters.get("account_id")
+            amount_cents = parameters.get("amount_cents")
+            currency = parameters.get("currency")
+            if (
+                not isinstance(account_id, str)
+                or account_id != row["target_reference"]
+                or not isinstance(amount_cents, int)
+                or isinstance(amount_cents, bool)
+                or not isinstance(currency, str)
+            ):
+                raise ActionExecutionAuthorizationError(
+                    "approved account-credit parameters are invalid"
+                )
+            command = AccountCreditInput(
+                organization_id=row["organization_id"],
+                case_id=row["case_id"],
+                proposal_id=row["id"],
+                account_reference=account_id,
+                amount_cents=amount_cents,
+                currency=currency,
+                idempotency_key=row["idempotency_key"],
+            )
+
+        try:
+            credit = self._account_credit_tool.apply_account_credit(command)
+        except AmbiguousAccountCreditError:
+            recovered_credit = self._account_credit_tool.get_by_idempotency_key(
+                organization_id=organization_id,
+                idempotency_key=command.idempotency_key,
+            )
+            if recovered_credit is None:
+                return self._record_action_result(
+                    lease=lease,
+                    organization_id=organization_id,
+                    proposal_id=command.proposal_id,
+                    idempotency_key=command.idempotency_key,
+                    status=ActionExecutionStatus.AMBIGUOUS,
+                    result={"error_code": "account_credit_outcome_ambiguous"},
+                )
+            credit = recovered_credit
+        except DuplicateCaseCreditError:
+            return self._record_action_result(
+                lease=lease,
+                organization_id=organization_id,
+                proposal_id=command.proposal_id,
+                idempotency_key=command.idempotency_key,
+                status=ActionExecutionStatus.FAILED,
+                result={"error_code": "case_already_credited"},
+            )
+
+        return self._record_action_result(
+            lease=lease,
+            organization_id=organization_id,
+            proposal_id=command.proposal_id,
+            idempotency_key=command.idempotency_key,
+            status=ActionExecutionStatus.SUCCEEDED,
+            result={
+                "credit_id": str(credit.credit_id),
+                "case_id": str(credit.case_id),
+                "account_reference": credit.account_reference,
+                "amount_cents": credit.amount_cents,
+                "currency": credit.currency,
+            },
+        )
+
+    def _record_action_result(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+        proposal_id: UUID,
+        idempotency_key: str,
+        status: ActionExecutionStatus,
+        result: dict[str, JsonValue],
+    ) -> ActionResult:
+        with self._connect() as connection, connection.cursor() as cursor:
+            self._lock_owned_lease(cursor, lease=lease, organization_id=organization_id)
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"executed-action:{proposal_id}",),
+            )
+            cursor.execute(
+                "SELECT * FROM app.executed_actions WHERE proposal_id = %s FOR UPDATE",
+                (proposal_id,),
+            )
+            existing = cursor.fetchone()
+            if existing is None:
+                cursor.execute(
+                    """
+                    INSERT INTO app.executed_actions (
+                        id, proposal_id, idempotency_key, status, result
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (uuid4(), proposal_id, idempotency_key, status.value, Jsonb(result)),
+                )
+            elif existing["status"] == ActionExecutionStatus.SUCCEEDED.value:
+                return _action_result_from_row(existing)
+            elif (
+                existing["status"] == ActionExecutionStatus.AMBIGUOUS.value
+                and status is ActionExecutionStatus.SUCCEEDED
+            ):
+                cursor.execute(
+                    """
+                    UPDATE app.executed_actions
+                    SET status = %s, result = %s, executed_at = CURRENT_TIMESTAMP
+                    WHERE proposal_id = %s AND status = 'ambiguous'
+                    RETURNING *
+                    """,
+                    (status.value, Jsonb(result), proposal_id),
+                )
+            else:
+                return _action_result_from_row(existing)
+            action_row = cursor.fetchone()
+            if action_row is None:  # pragma: no cover - INSERT/UPDATE RETURNING contract
+                raise RunRepositoryError("action result persistence returned no row")
+            if status is ActionExecutionStatus.SUCCEEDED:
+                cursor.execute(
+                    """
+                    UPDATE app.action_proposals
+                    SET status = 'executed'
+                    WHERE id = %s AND status IN ('approved', 'executed')
+                    """,
+                    (proposal_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise ActionExecutionAuthorizationError(
+                        "proposal approval changed before action result persistence"
+                    )
+            return _action_result_from_row(action_row)
 
     def get_run_case(
         self,
@@ -1463,6 +1692,16 @@ def _artifact_from_row(row: dict[str, Any]) -> RunArtifact:
     )
 
 
+def _action_result_from_row(row: dict[str, Any]) -> ActionResult:
+    return ActionResult(
+        proposal_id=row["proposal_id"],
+        idempotency_key=row["idempotency_key"],
+        status=row["status"],
+        result=row["result"],
+        executed_at=row["executed_at"],
+    )
+
+
 def _proposal_from_row(row: dict[str, Any]) -> ActionProposal:
     return ActionProposal(
         proposal_id=row["id"],
@@ -1487,9 +1726,11 @@ def _approval_request_from_row(
 ) -> ApprovalRequest:
     decision = None
     if row["decision"] is not None:
+        if row["decision_proposal_hash"] != proposal.proposal_hash:
+            raise StaleProposalError("persisted decision does not match its proposal hash")
         decision = ApprovalDecision(
             proposal_id=proposal.proposal_id,
-            proposal_hash=proposal.proposal_hash,
+            proposal_hash=row["decision_proposal_hash"],
             decision=row["decision"],
             comment=row["comment"],
             decided_by=row["decided_by"],

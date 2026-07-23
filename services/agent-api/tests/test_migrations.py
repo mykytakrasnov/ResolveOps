@@ -28,6 +28,7 @@ def test_initial_migration_renders_offline_without_credentials() -> None:
         "app.action_proposals",
         "app.approval_requests",
         "app.executed_actions",
+        "demo.account_credits",
         "app.run_artifacts",
         "app.idempotency_records",
     ):

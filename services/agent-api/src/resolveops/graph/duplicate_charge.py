@@ -19,6 +19,8 @@ from pydantic import BaseModel, JsonValue
 from resolveops.db.checkpoints import open_async_postgres_saver
 from resolveops.graph.state import DuplicateChargeState
 from resolveops.models.contracts import (
+    ActionExecutionStatus,
+    ActionResult,
     ApprovalDecisionType,
     ArtifactKind,
     CaseCategory,
@@ -74,6 +76,7 @@ ESCALATE_CASE = "escalate_case"
 DRAFT_RESPONSE = "draft_response"
 FINALIZE_RUN = "finalize_run"
 APPROVAL_GATE = "approval_gate"
+EXECUTE_APPROVED_ACTION = "execute_approved_action"
 REQUEST_APPROVAL = APPROVAL_GATE
 DUPLICATE_CHARGE_RECIPE = "duplicate_charge_v1"
 BILLING_POLICY_KEY = "billing_duplicate_credit"
@@ -132,6 +135,13 @@ class WorkflowPersistence(Protocol):
         decision: PolicyDecision,
         cited_evidence_ids: Sequence[str] = (),
     ) -> ApprovalGateRecords: ...
+
+    def execute_approved_action(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+    ) -> ActionResult: ...
 
 
 @dataclass(frozen=True)
@@ -364,6 +374,17 @@ def build_duplicate_charge_graph(
         ),
     )
     graph.add_node(
+        EXECUTE_APPROVED_ACTION,
+        cast(
+            Any,
+            _execute_approved_action_node(
+                persistence=persistence,
+                lease=lease,
+                organization_id=organization_id,
+            ),
+        ),
+    )
+    graph.add_node(
         DRAFT_RESPONSE,
         cast(
             Any,
@@ -410,10 +431,11 @@ def build_duplicate_charge_graph(
             APPROVAL_GATE,
             _route_approval_decision,
             {
-                ApprovalDecisionType.APPROVE.value: END,
+                ApprovalDecisionType.APPROVE.value: EXECUTE_APPROVED_ACTION,
                 ApprovalDecisionType.REJECT.value: ESCALATE_CASE,
             },
         )
+        graph.add_edge(EXECUTE_APPROVED_ACTION, DRAFT_RESPONSE)
     else:
         graph.add_edge(APPROVAL_GATE, END)
     return graph.compile(checkpointer=checkpointer)
@@ -947,6 +969,71 @@ def _route_approval_decision(state: DuplicateChargeState) -> str:
     return state["approval_decision"].value
 
 
+def _execute_approved_action_node(
+    *,
+    persistence: WorkflowPersistence,
+    lease: ExecutionLease,
+    organization_id: UUID,
+) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
+    def node(state: DuplicateChargeState) -> DuplicateChargeState:
+        started = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_STARTED,
+            node_name=EXECUTE_APPROVED_ACTION,
+            status="running",
+            public_payload={"summary": "Approved synthetic account credit execution started."},
+        )
+        action_result = persistence.execute_approved_action(
+            lease=lease,
+            organization_id=organization_id,
+        )
+        if action_result.status is not ActionExecutionStatus.SUCCEEDED:
+            persistence.append_event(
+                lease=lease,
+                organization_id=organization_id,
+                event_type=WorkflowEventType.NODE_COMPLETED,
+                node_name=EXECUTE_APPROVED_ACTION,
+                status=action_result.status.value,
+                public_payload={
+                    "summary": "Synthetic account credit did not reach a confirmed success.",
+                    "proposal_id": str(action_result.proposal_id),
+                    "action_status": action_result.status.value,
+                },
+            )
+            raise RuntimeError(
+                f"approved action execution ended with status {action_result.status.value}"
+            )
+        executed = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.ACTION_EXECUTED,
+            node_name=EXECUTE_APPROVED_ACTION,
+            status="succeeded",
+            public_payload={
+                "summary": "Synthetic account credit applied exactly once.",
+                "proposal_id": str(action_result.proposal_id),
+                "idempotency_key": action_result.idempotency_key,
+                "result": cast(JsonValue, action_result.result),
+            },
+        )
+        completed = persistence.append_event(
+            lease=lease,
+            organization_id=organization_id,
+            event_type=WorkflowEventType.NODE_COMPLETED,
+            node_name=EXECUTE_APPROVED_ACTION,
+            status="completed",
+            public_payload={"summary": "Approved action execution completed."},
+        )
+        return {
+            "action_result": action_result,
+            "workflow_outcome": WorkflowOutcome.APPROVAL_REQUIRED,
+            "emitted_events": [started, executed, completed],
+        }
+
+    return node
+
+
 def _draft_response_node(
     *,
     persistence: WorkflowPersistence,
@@ -1050,8 +1137,21 @@ def _deterministic_fallback_draft(
                 "The available synthetic records are incomplete or do not support a safe automated "
                 "conclusion; a specialist must verify the missing information."
             )
-    else:  # pragma: no cover - graph routing excludes approval-required drafting
-        raise RuntimeError("approval-required outcomes cannot be drafted or finalized")
+    else:
+        action_result = state.get("action_result")
+        if action_result is None or action_result.status is not ActionExecutionStatus.SUCCEEDED:
+            raise RuntimeError("approval-required outcomes need a confirmed action result")
+        amount = action_result.result.get("amount_cents")
+        body = (
+            "We confirmed the duplicate synthetic AtlasFlow charge and applied an account credit"
+            f"{f' of {amount} cents' if isinstance(amount, int) else ''}. "
+            f"Evidence reviewed: {citation_text}."
+        )
+        internal_note = (
+            "Reviewer approval was verified and the synthetic account credit executed exactly "
+            f"once. Proposal: {action_result.proposal_id}. Evidence: {citation_text}."
+        )
+        uncertainty = None
     return FinalResponse(
         subject="Update on your AtlasFlow billing investigation",
         body=body,
@@ -1070,8 +1170,11 @@ def _finalize_node(
 ) -> Callable[[DuplicateChargeState], DuplicateChargeState]:
     def node(state: DuplicateChargeState) -> DuplicateChargeState:
         outcome = state["workflow_outcome"]
-        if outcome is WorkflowOutcome.APPROVAL_REQUIRED:
-            raise RuntimeError("approval-required outcomes cannot be finalized")
+        if outcome is WorkflowOutcome.APPROVAL_REQUIRED and (
+            state.get("action_result") is None
+            or state["action_result"].status is not ActionExecutionStatus.SUCCEEDED
+        ):
+            raise RuntimeError("approval-required outcomes need a confirmed action result")
         started = persistence.append_event(
             lease=lease,
             organization_id=organization_id,
@@ -1135,6 +1238,12 @@ def _structured_report(state: DuplicateChargeState) -> dict[str, JsonValue]:
         "workflow_outcome": state["workflow_outcome"].value,
         "reason_code": state.get("workflow_reason_code", state["policy_decision"].reason_code),
         "final_response": cast(JsonValue, state["final_response"].model_dump(mode="json")),
+        "action_result": cast(
+            JsonValue,
+            state["action_result"].model_dump(mode="json")
+            if state.get("action_result") is not None
+            else None,
+        ),
         "evidence": cast(
             JsonValue,
             [

@@ -333,6 +333,10 @@ class FakePersistence:
         del kwargs
         raise AssertionError("the non-checkpointed unit graph must not persist approval records")
 
+    def execute_approved_action(self, **kwargs: object) -> Any:
+        del kwargs
+        raise AssertionError("the non-checkpointed unit graph must not execute approved actions")
+
 
 class FailingObjectStorage:
     def put_object(self, **kwargs: object) -> StoredObject:

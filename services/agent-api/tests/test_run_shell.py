@@ -35,7 +35,9 @@ from resolveops.graph.duplicate_charge import (
     resume_checkpointed_duplicate_charge_graph as real_resume_checkpointed_graph,
 )
 from resolveops.models.contracts import (
+    ActionExecutionStatus,
     ActionType,
+    ApprovalDecisionType,
     ArtifactKind,
     PolicyDecision,
     RiskLevel,
@@ -43,6 +45,8 @@ from resolveops.models.contracts import (
     WorkflowOutcome,
 )
 from resolveops.repositories.runs import (
+    ActionExecutionAuthorizationError,
+    ApprovalGateRecords,
     DatabaseRunRepository,
     ExecutionLease,
     LostExecutionLeaseError,
@@ -50,6 +54,12 @@ from resolveops.repositories.runs import (
     RunRepositoryError,
 )
 from resolveops.storage.artifacts import InMemoryObjectStorage, StoredObject
+from resolveops.tools.account_credit import (
+    AccountCreditInput,
+    AccountCreditRecord,
+    AmbiguousAccountCreditError,
+    DatabaseAccountCreditTool,
+)
 from resolveops.tools.contracts import (
     CustomerRecord,
     GetPaymentAttemptsInput,
@@ -198,6 +208,55 @@ class ApprovalDatabaseTestBackend(DatabaseTestBackend):
         )
 
 
+class AmbiguousAfterCommitAccountCreditTool(DatabaseAccountCreditTool):
+    def __init__(self, dsn: str) -> None:
+        super().__init__(dsn)
+        self.fail_once = True
+        self.recovery_queries = 0
+
+    def _after_commit(self, record: AccountCreditRecord) -> None:
+        del record
+        if self.fail_once:
+            self.fail_once = False
+            raise AmbiguousAccountCreditError("synthetic post-commit transport failure")
+
+    def get_by_idempotency_key(
+        self,
+        *,
+        organization_id: UUID,
+        idempotency_key: str,
+    ) -> AccountCreditRecord | None:
+        self.recovery_queries += 1
+        return super().get_by_idempotency_key(
+            organization_id=organization_id,
+            idempotency_key=idempotency_key,
+        )
+
+
+def test_account_credit_classifies_database_transport_failure_as_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = DatabaseAccountCreditTool("postgresql://unused")
+
+    def fail_connection() -> None:
+        raise psycopg.OperationalError("synthetic connection loss")
+
+    monkeypatch.setattr(tool, "_connect", fail_connection)
+
+    with pytest.raises(AmbiguousAccountCreditError, match="outcome is ambiguous"):
+        tool.apply_account_credit(
+            AccountCreditInput(
+                organization_id=uuid4(),
+                case_id=uuid4(),
+                proposal_id=uuid4(),
+                account_reference=str(TEST_ACCOUNT_ID),
+                amount_cents=4_900,
+                currency="USD",
+                idempotency_key=f"resolveops:{uuid4()}:apply_account_credit:v1",
+            )
+        )
+
+
 @dataclass(frozen=True)
 class SeededCase:
     principal: Principal
@@ -288,6 +347,69 @@ def seeded_case(database_url: str) -> SeededCase:
         ),
         case_id=case_id,
     )
+
+
+def _approval_policy_decision() -> PolicyDecision:
+    return PolicyDecision(
+        outcome=WorkflowOutcome.APPROVAL_REQUIRED,
+        risk_level=RiskLevel.R2,
+        reason_code="duplicate_charge_within_limit",
+        action_type=ActionType.APPLY_ACCOUNT_CREDIT,
+        target_reference=str(TEST_ACCOUNT_ID),
+        canonical_parameters={
+            "account_id": str(TEST_ACCOUNT_ID),
+            "amount_cents": 4_900,
+            "currency": "USD",
+        },
+        policy_key="billing_duplicate_credit",
+        policy_version="3.0",
+        approval_required=True,
+    )
+
+
+def _prepare_decided_action(
+    repository: DatabaseRunRepository,
+    seeded_case: SeededCase,
+    *,
+    decision: ApprovalDecisionType,
+) -> tuple[ApprovalGateRecords, ExecutionLease]:
+    created = repository.create_run(
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        case_id=seeded_case.case_id,
+        idempotency_key=uuid4(),
+    )
+    initial_lease = repository.acquire_execution_lease(
+        run_id=created.run.run_id,
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        lease_seconds=60,
+    )
+    records = repository.create_approval_gate_records(
+        lease=initial_lease,
+        organization_id=seeded_case.principal.organization_id,
+        decision=_approval_policy_decision(),
+    )
+    repository.mark_waiting_for_approval(
+        lease=initial_lease,
+        organization_id=seeded_case.principal.organization_id,
+        records=records,
+    )
+    decided = repository.record_approval_decision(
+        run_id=created.run.run_id,
+        organization_id=seeded_case.principal.organization_id,
+        reviewer_user_id=seeded_case.principal.user_id,
+        proposal_id=records.proposal.proposal_id,
+        proposal_hash=records.proposal.proposal_hash,
+        decision=decision,
+        comment="Rejected by deterministic test."
+        if decision is ApprovalDecisionType.REJECT
+        else None,
+        idempotency_key=uuid4(),
+        lease_seconds=60,
+    )
+    assert decided.lease is not None
+    return records, decided.lease
 
 
 def _client(
@@ -563,6 +685,156 @@ def test_approval_proposal_replay_is_hash_stable_and_rejects_divergence(
                 }
             ),
         )
+
+
+def test_execute_approved_action_requires_a_matching_persisted_approval(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    repository = DatabaseRunRepository(database_url)
+    created = repository.create_run(
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        case_id=seeded_case.case_id,
+        idempotency_key=uuid4(),
+    )
+    lease = repository.acquire_execution_lease(
+        run_id=created.run.run_id,
+        organization_id=seeded_case.principal.organization_id,
+        actor_user_id=seeded_case.principal.user_id,
+        lease_seconds=60,
+    )
+
+    with pytest.raises(
+        ActionExecutionAuthorizationError,
+        match="proposal was not persisted",
+    ):
+        repository.execute_approved_action(
+            lease=lease,
+            organization_id=seeded_case.principal.organization_id,
+        )
+
+
+def test_execute_approved_action_refuses_rejected_and_stale_decisions(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    rejected_repository = DatabaseRunRepository(database_url)
+    _, rejected_lease = _prepare_decided_action(
+        rejected_repository,
+        seeded_case,
+        decision=ApprovalDecisionType.REJECT,
+    )
+    with pytest.raises(ActionExecutionAuthorizationError, match="does not match"):
+        rejected_repository.execute_approved_action(
+            lease=rejected_lease,
+            organization_id=seeded_case.principal.organization_id,
+        )
+
+    stale_records, stale_lease = _prepare_decided_action(
+        rejected_repository,
+        seeded_case,
+        decision=ApprovalDecisionType.APPROVE,
+    )
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE app.approval_requests
+            SET decision_proposal_hash = %s
+            WHERE proposal_id = %s
+            """,
+            ("0" * 64, stale_records.proposal.proposal_id),
+        )
+    with pytest.raises(ActionExecutionAuthorizationError, match="does not match"):
+        rejected_repository.execute_approved_action(
+            lease=stale_lease,
+            organization_id=seeded_case.principal.organization_id,
+        )
+
+
+def test_account_credit_recovers_ambiguous_commit_and_duplicate_execution(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    credit_tool = AmbiguousAfterCommitAccountCreditTool(database_url)
+    repository = DatabaseRunRepository(database_url, account_credit_tool=credit_tool)
+    records, lease = _prepare_decided_action(
+        repository,
+        seeded_case,
+        decision=ApprovalDecisionType.APPROVE,
+    )
+
+    first = repository.execute_approved_action(
+        lease=lease,
+        organization_id=seeded_case.principal.organization_id,
+    )
+    replay = repository.execute_approved_action(
+        lease=lease,
+        organization_id=seeded_case.principal.organization_id,
+    )
+
+    assert first.status is ActionExecutionStatus.SUCCEEDED
+    assert replay == first
+    assert first.proposal_id == records.proposal.proposal_id
+    assert first.idempotency_key == records.proposal.idempotency_key
+    assert credit_tool.recovery_queries == 1
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM demo.account_credits WHERE case_id = %s",
+            (seeded_case.case_id,),
+        )
+        assert cursor.fetchone() == (1,)
+        cursor.execute(
+            """
+            SELECT proposal_id, idempotency_key, status, result, executed_at
+            FROM app.executed_actions
+            WHERE proposal_id = %s
+            """,
+            (records.proposal.proposal_id,),
+        )
+        action = cursor.fetchone()
+    assert action is not None
+    assert action[0] == records.proposal.proposal_id
+    assert action[1] == records.proposal.idempotency_key
+    assert action[2] == "succeeded"
+    assert action[3]["amount_cents"] == 4_900
+    assert action[4] == first.executed_at
+
+
+def test_same_case_cannot_receive_a_second_credit(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    repository = DatabaseRunRepository(database_url)
+    _, first_lease = _prepare_decided_action(
+        repository,
+        seeded_case,
+        decision=ApprovalDecisionType.APPROVE,
+    )
+    first = repository.execute_approved_action(
+        lease=first_lease,
+        organization_id=seeded_case.principal.organization_id,
+    )
+    second_records, second_lease = _prepare_decided_action(
+        repository,
+        seeded_case,
+        decision=ApprovalDecisionType.APPROVE,
+    )
+    second = repository.execute_approved_action(
+        lease=second_lease,
+        organization_id=seeded_case.principal.organization_id,
+    )
+
+    assert first.status is ActionExecutionStatus.SUCCEEDED
+    assert second.status is ActionExecutionStatus.FAILED
+    assert second.result == {"error_code": "case_already_credited"}
+    assert second.proposal_id == second_records.proposal.proposal_id
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM demo.account_credits WHERE case_id = %s",
+            (seeded_case.case_id,),
+        )
+        assert cursor.fetchone() == (1,)
 
 
 def test_execute_persists_monotonic_events_before_sse_and_supports_reconnect(
@@ -867,8 +1139,8 @@ def test_reviewer_approves_resumes_once_and_rejects_stale_or_divergent_replays(
     assert 'node_name":"execute_approved_action"' in stream_replay.text
     assert divergent.status_code == 409
     assert stale.status_code == 409
-    assert run.json()["status"] == "waiting_for_approval"
-    assert run.json()["current_node"] == "execute_approved_action"
+    assert run.json()["status"] == "completed"
+    assert run.json()["current_node"] is None
     with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
         cursor.execute(
             """
@@ -876,12 +1148,24 @@ def test_reviewer_approves_resumes_once_and_rejects_stale_or_divergent_replays(
                    count(*) FILTER (
                      WHERE event_type = 'node.started'
                        AND node_name = 'execute_approved_action'
-                   )
+                   ),
+                   count(*) FILTER (WHERE event_type = 'action.executed'),
+                   count(*) FILTER (WHERE event_type = 'run.completed')
             FROM audit.workflow_events WHERE run_id = %s
             """,
             (run_id,),
         )
-        assert cursor.fetchone() == (1, 1)
+        assert cursor.fetchone() == (1, 1, 1, 1)
+        cursor.execute(
+            "SELECT count(*) FROM demo.account_credits WHERE case_id = %s",
+            (seeded_case.case_id,),
+        )
+        assert cursor.fetchone() == (1,)
+        cursor.execute(
+            "SELECT count(*) FROM app.executed_actions WHERE proposal_id = %s",
+            (proposal["proposal_id"],),
+        )
+        assert cursor.fetchone() == (1,)
 
 
 def test_failed_decision_resume_releases_lease_and_retries_without_duplicate_event(

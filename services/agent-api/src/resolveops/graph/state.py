@@ -7,6 +7,7 @@ from typing import Annotated, TypedDict
 from uuid import UUID
 
 from resolveops.models.contracts import (
+    ActionResult,
     ApprovalDecisionType,
     CaseClassification,
     DuplicateChargeValidation,
@@ -41,4 +42,5 @@ class DuplicateChargeState(TypedDict, total=False):
     workflow_outcome: WorkflowOutcome
     workflow_reason_code: str
     approval_decision: ApprovalDecisionType
+    action_result: ActionResult
     emitted_events: Annotated[list[WorkflowEvent], add]
