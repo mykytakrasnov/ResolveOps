@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import resolveops.api.runs as run_routes
@@ -25,9 +26,14 @@ from resolveops.api.runs import (
     _execute_shell,
     _replay_execution,
     _start_independent_execution,
+    require_operator,
     require_principal,
+    require_reviewer,
 )
 from resolveops.db.checkpoints import open_async_postgres_saver
+from resolveops.graph.duplicate_charge import (
+    resume_checkpointed_duplicate_charge_graph as real_resume_checkpointed_graph,
+)
 from resolveops.models.contracts import (
     ActionType,
     ArtifactKind,
@@ -66,6 +72,36 @@ TEST_SUBSCRIPTION_ID = UUID("09615c4c-25ac-5d56-a6d1-6bbc4573e5e0")
 TEST_INVOICE_ID = UUID("5837ede5-6c6f-59e8-8cad-52fb7a66d25a")
 TEST_PAYMENT_ID = UUID("92c4c18e-51d4-5c66-9120-e26056a90e4d")
 TEST_POLICY_ID = UUID("62141d26-a9f1-5fb1-89bc-f3bd25cbf4a8")
+
+
+def test_operator_and_reviewer_permissions_remain_distinct() -> None:
+    operator = Principal(
+        organization_id=uuid4(),
+        user_id=uuid4(),
+        roles=frozenset({"operator"}),
+    )
+    reviewer = Principal(
+        organization_id=operator.organization_id,
+        user_id=operator.user_id,
+        roles=frozenset({"reviewer"}),
+    )
+    demo_user = Principal(
+        organization_id=operator.organization_id,
+        user_id=operator.user_id,
+        roles=frozenset({"operator", "reviewer"}),
+    )
+
+    with pytest.raises(HTTPException) as review_denied:
+        require_reviewer(operator)
+    with pytest.raises(HTTPException) as investigate_denied:
+        require_operator(reviewer)
+
+    assert review_denied.value.status_code == 403
+    assert investigate_denied.value.status_code == 403
+    assert require_reviewer(reviewer) is reviewer
+    assert require_operator(operator) is operator
+    assert require_reviewer(demo_user) is demo_user
+    assert require_operator(demo_user) is demo_user
 
 
 class DatabaseTestBackend:
@@ -760,6 +796,208 @@ def test_approval_gate_persists_immutable_proposal_checkpoint_and_waiting_state(
         )
 
 
+def test_reviewer_approves_resumes_once_and_rejects_stale_or_divergent_replays(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    reviewer = Principal(
+        organization_id=seeded_case.principal.organization_id,
+        user_id=seeded_case.principal.user_id,
+        roles=frozenset({"operator", "reviewer"}),
+    )
+    with _client(database_url, reviewer, ApprovalDatabaseTestBackend()) as client:
+        created, _ = _create_run(client, seeded_case.case_id)
+        run_id = created["run_id"]
+        execute = client.post(
+            f"/api/v1/runs/{run_id}/execute",
+            headers={"Idempotency-Key": str(uuid4())},
+        )
+        assert execute.status_code == 200
+        detail = client.get(f"/api/v1/runs/{run_id}/approval")
+        queue = client.get("/api/v1/runs/approvals")
+        assert detail.status_code == 200
+        proposal = detail.json()["approval"]["proposal"]
+        assert queue.json()["items"][0]["run_id"] == run_id
+        assert detail.json()["cited_evidence"]
+
+        key = uuid4()
+        payload = {
+            "proposal_id": proposal["proposal_id"],
+            "proposal_hash": proposal["proposal_hash"],
+            "decision": "approve",
+            "comment": "Evidence and policy verified.",
+        }
+        approved = client.post(
+            f"/api/v1/runs/{run_id}/decisions",
+            headers={"Idempotency-Key": str(key)},
+            json=payload,
+        )
+        replay = client.post(
+            f"/api/v1/runs/{run_id}/decisions",
+            headers={"Idempotency-Key": str(key)},
+            json=payload,
+        )
+        stream_replay = client.post(
+            f"/api/v1/runs/{run_id}/decisions",
+            headers={
+                "Accept": "text/event-stream",
+                "Idempotency-Key": str(key),
+            },
+            json=payload,
+        )
+        divergent = client.post(
+            f"/api/v1/runs/{run_id}/decisions",
+            headers={"Idempotency-Key": str(key)},
+            json={**payload, "decision": "reject", "comment": "Changed my mind."},
+        )
+        stale = client.post(
+            f"/api/v1/runs/{run_id}/decisions",
+            headers={"Idempotency-Key": str(uuid4())},
+            json={**payload, "proposal_hash": "0" * 64},
+        )
+        run = client.get(f"/api/v1/runs/{run_id}")
+
+    assert approved.status_code == 200, approved.text
+    assert approved.headers["Idempotent-Replay"] == "false"
+    assert replay.status_code == 200
+    assert replay.headers["Idempotent-Replay"] == "true"
+    assert stream_replay.status_code == 200
+    assert stream_replay.headers["content-type"].startswith("text/event-stream")
+    assert "event: approval.decided" in stream_replay.text
+    assert 'node_name":"execute_approved_action"' in stream_replay.text
+    assert divergent.status_code == 409
+    assert stale.status_code == 409
+    assert run.json()["status"] == "waiting_for_approval"
+    assert run.json()["current_node"] == "execute_approved_action"
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT count(*) FILTER (WHERE event_type = 'approval.decided'),
+                   count(*) FILTER (
+                     WHERE event_type = 'node.started'
+                       AND node_name = 'execute_approved_action'
+                   )
+            FROM audit.workflow_events WHERE run_id = %s
+            """,
+            (run_id,),
+        )
+        assert cursor.fetchone() == (1, 1)
+
+
+def test_failed_decision_resume_releases_lease_and_retries_without_duplicate_event(
+    database_url: str,
+    seeded_case: SeededCase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reviewer = Principal(
+        organization_id=seeded_case.principal.organization_id,
+        user_id=seeded_case.principal.user_id,
+        roles=frozenset({"operator", "reviewer"}),
+    )
+    fail_once = True
+
+    async def flaky_resume(**kwargs: Any) -> Any:
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise RuntimeError("synthetic resume interruption")
+        return await real_resume_checkpointed_graph(**kwargs)
+
+    monkeypatch.setattr(run_routes, "resume_checkpointed_duplicate_charge_graph", flaky_resume)
+    with _client(database_url, reviewer, ApprovalDatabaseTestBackend()) as client:
+        created, _ = _create_run(client, seeded_case.case_id)
+        run_id = created["run_id"]
+        client.post(
+            f"/api/v1/runs/{run_id}/execute",
+            headers={"Idempotency-Key": str(uuid4())},
+        )
+        proposal = client.get(f"/api/v1/runs/{run_id}/approval").json()["approval"]["proposal"]
+        key = uuid4()
+        payload = {
+            "proposal_id": proposal["proposal_id"],
+            "proposal_hash": proposal["proposal_hash"],
+            "decision": "approve",
+            "comment": "Evidence and policy verified.",
+        }
+        with pytest.raises(RuntimeError, match="synthetic resume interruption"):
+            client.post(
+                f"/api/v1/runs/{run_id}/decisions",
+                headers={"Idempotency-Key": str(key)},
+                json=payload,
+            )
+        recovered = client.post(
+            f"/api/v1/runs/{run_id}/decisions",
+            headers={"Idempotency-Key": str(key)},
+            json=payload,
+        )
+
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.headers["Idempotent-Replay"] == "true"
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT count(*) FILTER (WHERE event_type = 'approval.decided'),
+                   count(*) FILTER (
+                     WHERE event_type = 'node.started'
+                       AND node_name = 'execute_approved_action'
+                   )
+            FROM audit.workflow_events WHERE run_id = %s
+            """,
+            (run_id,),
+        )
+        assert cursor.fetchone() == (1, 1)
+
+
+def test_reviewer_rejection_requires_comment_and_resumes_to_escalation(
+    database_url: str,
+    seeded_case: SeededCase,
+) -> None:
+    reviewer = Principal(
+        organization_id=seeded_case.principal.organization_id,
+        user_id=seeded_case.principal.user_id,
+        roles=frozenset({"operator", "reviewer"}),
+    )
+    with _client(database_url, reviewer, ApprovalDatabaseTestBackend()) as client:
+        created, _ = _create_run(client, seeded_case.case_id)
+        run_id = created["run_id"]
+        client.post(
+            f"/api/v1/runs/{run_id}/execute",
+            headers={"Idempotency-Key": str(uuid4())},
+        )
+        proposal = client.get(f"/api/v1/runs/{run_id}/approval").json()["approval"]["proposal"]
+        missing = client.post(
+            f"/api/v1/runs/{run_id}/decisions",
+            headers={"Idempotency-Key": str(uuid4())},
+            json={
+                "proposal_id": proposal["proposal_id"],
+                "proposal_hash": proposal["proposal_hash"],
+                "decision": "reject",
+                "comment": "  ",
+            },
+        )
+        rejected = client.post(
+            f"/api/v1/runs/{run_id}/decisions",
+            headers={"Idempotency-Key": str(uuid4())},
+            json={
+                "proposal_id": proposal["proposal_id"],
+                "proposal_hash": proposal["proposal_hash"],
+                "decision": "reject",
+                "comment": "Policy exception needs specialist review.",
+            },
+        )
+        run = client.get(f"/api/v1/runs/{run_id}")
+
+    assert missing.status_code == 422
+    assert rejected.status_code == 200, rejected.text
+    assert run.json()["status"] == "escalated"
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM app.executed_actions WHERE proposal_id = %s",
+            (proposal["proposal_id"],),
+        )
+        assert cursor.fetchone() == (0,)
+
+
 def test_active_execution_lease_rejects_a_concurrent_executor(
     database_url: str,
     seeded_case: SeededCase,
@@ -1126,3 +1364,26 @@ def test_same_organization_operator_cannot_read_or_execute_another_users_run(
 
     assert read_response.status_code == 404
     assert execute_response.status_code == 404
+
+    reviewer = Principal(
+        organization_id=seeded_case.principal.organization_id,
+        user_id=uuid4(),
+        roles=frozenset({"reviewer"}),
+    )
+    with _client(database_url, reviewer) as client:
+        review_read = client.get(f"/api/v1/runs/{created.run.run_id}")
+        review_events = client.get(f"/api/v1/runs/{created.run.run_id}/events")
+        review_create = client.post(
+            "/api/v1/runs",
+            headers={"Idempotency-Key": str(uuid4())},
+            json={"case_id": str(seeded_case.case_id)},
+        )
+        review_execute = client.post(
+            f"/api/v1/runs/{created.run.run_id}/execute",
+            headers={"Idempotency-Key": str(uuid4())},
+        )
+
+    assert review_read.status_code == 200
+    assert review_events.status_code == 200
+    assert review_create.status_code == 403
+    assert review_execute.status_code == 403

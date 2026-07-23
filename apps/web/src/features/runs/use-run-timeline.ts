@@ -28,7 +28,7 @@ function mergeEvents(current: WorkflowEvent[], incoming: WorkflowEvent[]) {
   );
 }
 
-export function useRunTimeline(runId: string) {
+export function useRunTimeline(runId: string, refreshKey = 0) {
   const [run, setRun] = useState<WorkflowRun | null>(null);
   const [events, setEvents] = useState<WorkflowEvent[]>([]);
   const [connectionState, setConnectionState] =
@@ -46,6 +46,7 @@ export function useRunTimeline(runId: string) {
   }, []);
 
   useEffect(() => {
+    void refreshKey;
     const controller = new AbortController();
     let pollTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -121,7 +122,7 @@ export function useRunTimeline(runId: string) {
       controller.abort();
       if (pollTimer) clearTimeout(pollTimer);
     };
-  }, [addEvents, runId]);
+  }, [addEvents, refreshKey, runId]);
 
   return { run, events, connectionState, connectionError };
 }

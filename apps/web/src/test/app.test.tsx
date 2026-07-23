@@ -96,6 +96,61 @@ function approvalRequestedEvent() {
   };
 }
 
+function approvalItem(decision: "approve" | "reject" | null = null) {
+  return {
+    run_id: RUN_ID,
+    case_id: CASE_ID,
+    case_subject: supportCase.subject,
+    approval: {
+      request_id: "66666666-6666-5666-8666-666666666666",
+      proposal: {
+        proposal_id: "77777777-7777-5777-8777-777777777777",
+        run_id: RUN_ID,
+        action_type: "apply_account_credit",
+        target_reference: "org_atlas_001",
+        canonical_parameters: {
+          account_id: "org_atlas_001",
+          amount_cents: 4900,
+          currency: "USD",
+        },
+        proposal_hash: "a".repeat(64),
+        risk_level: "R2",
+        policy_key: "billing_duplicate_credit",
+        policy_version: "3.0",
+        status:
+          decision === "approve"
+            ? "approved"
+            : decision === "reject"
+              ? "rejected"
+              : "pending_approval",
+        idempotency_key: `resolveops:${RUN_ID}:apply_account_credit:v1`,
+        created_at: "2026-07-22T12:00:05Z",
+      },
+      requested_by: USER_ID,
+      requested_at: "2026-07-22T12:00:05Z",
+      decision: decision
+        ? {
+            proposal_id: "77777777-7777-5777-8777-777777777777",
+            proposal_hash: "a".repeat(64),
+            decision,
+            comment: decision === "reject" ? "Needs specialist review." : null,
+            decided_by: USER_ID,
+            decided_at: "2026-07-22T12:01:00Z",
+          }
+        : null,
+    },
+    cited_evidence: [
+      {
+        evidence_id: "payment_001",
+        source_system: "billing",
+        object_type: "payment_attempt",
+        object_id: "pay_001",
+        fact: "Two synthetic payments succeeded for one invoice period.",
+      },
+    ],
+  };
+}
+
 function jsonResponse(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
     status,
@@ -123,6 +178,104 @@ afterEach(() => {
 });
 
 describe("case workflow surface", () => {
+  test("review queue opens a persistent proposal and requires a rejection comment", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/v1/runs/approvals")) {
+          return jsonResponse({ items: [approvalItem()] });
+        }
+        if (url.endsWith(`/runs/${RUN_ID}`)) {
+          return jsonResponse(workflowRun("waiting_for_approval"));
+        }
+        if (url.endsWith(`/runs/${RUN_ID}/approval`)) {
+          return jsonResponse(approvalItem());
+        }
+        if (url.endsWith(`/cases/${CASE_ID}`)) return jsonResponse(supportCase);
+        if (url.includes(`/runs/${RUN_ID}/events`)) {
+          return jsonResponse(eventPage([approvalRequestedEvent()]));
+        }
+        if (
+          url.endsWith(`/runs/${RUN_ID}/decisions`) &&
+          init?.method === "POST"
+        ) {
+          return jsonResponse({
+            run_id: RUN_ID,
+            approval: approvalItem("reject").approval,
+            idempotent_replay: false,
+          });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderRoute("/app/review");
+
+    await userEvent.click(
+      await screen.findByRole("link", { name: supportCase.subject }),
+    );
+    expect(await screen.findByText("Action proposal")).toBeInTheDocument();
+    expect(screen.getByText("$49.00")).toBeInTheDocument();
+    expect(screen.getAllByText("org_atlas_001").length).toBeGreaterThan(0);
+    expect(
+      screen.getByText("billing_duplicate_credit · v3.0"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("payment_001")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Reject" }));
+    const confirm = screen.getByRole("button", { name: "Reject proposal" });
+    expect(confirm).toBeDisabled();
+    await userEvent.type(
+      screen.getByLabelText("Review comment (required)"),
+      "Needs specialist review.",
+    );
+    expect(confirm).toBeEnabled();
+    await userEvent.click(confirm);
+
+    const decisionCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        String(input).endsWith(`/runs/${RUN_ID}/decisions`) &&
+        init?.method === "POST",
+    );
+    expect(JSON.parse(String(decisionCall?.[1]?.body))).toMatchObject({
+      proposal_id: approvalItem().approval.proposal.proposal_id,
+      proposal_hash: "a".repeat(64),
+      decision: "reject",
+      comment: "Needs specialist review.",
+    });
+  });
+
+  test("browser refresh restores an approved proposal without offering another decision", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith(`/runs/${RUN_ID}`)) {
+          return jsonResponse(workflowRun("waiting_for_approval"));
+        }
+        if (url.endsWith(`/runs/${RUN_ID}/approval`)) {
+          return jsonResponse(approvalItem("approve"));
+        }
+        if (url.endsWith(`/cases/${CASE_ID}`)) return jsonResponse(supportCase);
+        if (url.includes(`/runs/${RUN_ID}/events`)) {
+          return jsonResponse(eventPage([approvalRequestedEvent()]));
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }),
+    );
+    renderRoute(`/app/runs/${RUN_ID}`);
+
+    expect(
+      await screen.findByText("Approved · awaiting execution"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Approve" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Reject" }),
+    ).not.toBeInTheDocument();
+  });
+
   test("selecting an inbox case opens its detail", async () => {
     vi.stubGlobal(
       "fetch",

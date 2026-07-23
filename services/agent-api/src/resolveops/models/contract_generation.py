@@ -55,6 +55,13 @@ from resolveops.models.contracts import (
     WorkflowOutcome,
     WorkflowRun,
 )
+from resolveops.models.run_api import (
+    ApprovalDecisionRequest,
+    ApprovalDecisionResponse,
+    ApprovalEvidence,
+    ApprovalQueueItem,
+    ApprovalQueuePage,
+)
 
 CONTRACT_ENUMS: tuple[type[StrEnum], ...] = (
     SourceSystem,
@@ -99,6 +106,11 @@ CONTRACT_MODELS: tuple[type[BaseModel], ...] = (
     WorkflowRun,
     WorkflowEvent,
     RunArtifact,
+    ApprovalDecisionRequest,
+    ApprovalEvidence,
+    ApprovalQueueItem,
+    ApprovalQueuePage,
+    ApprovalDecisionResponse,
 )
 
 

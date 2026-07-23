@@ -13,6 +13,7 @@ from resolveops.models.contracts import (
     TicketInput,
     ToolResult,
 )
+from resolveops.models.run_api import ApprovalDecisionRequest
 
 
 def test_ticket_input_rejects_undeclared_fields() -> None:
@@ -61,6 +62,14 @@ def test_rejected_approval_requires_a_review_comment() -> None:
             decision=ApprovalDecisionType.REJECT,
             decided_by=UUID("cb6126fb-d633-4b19-a13e-e2cefe5431d5"),
             decided_at=datetime(2026, 7, 22, tzinfo=UTC),
+        )
+
+    with pytest.raises(ValidationError, match="comment is required"):
+        ApprovalDecisionRequest(
+            proposal_id=UUID("6cbf2c34-1bea-4e90-9dc8-5f2b15a0ec61"),
+            proposal_hash="a" * 64,
+            decision=ApprovalDecisionType.REJECT,
+            comment="   ",
         )
 
 

@@ -238,6 +238,68 @@
         "title": "ApprovalDecision",
         "type": "object"
       },
+      "ApprovalDecisionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "comment": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Comment"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecisionType"
+          },
+          "proposal_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Proposal Hash",
+            "type": "string"
+          },
+          "proposal_id": {
+            "format": "uuid",
+            "title": "Proposal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "proposal_hash",
+          "decision"
+        ],
+        "title": "ApprovalDecisionRequest",
+        "type": "object"
+      },
+      "ApprovalDecisionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "approval": {
+            "$ref": "#/components/schemas/ApprovalRequest"
+          },
+          "idempotent_replay": {
+            "title": "Idempotent Replay",
+            "type": "boolean"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "approval",
+          "idempotent_replay"
+        ],
+        "title": "ApprovalDecisionResponse",
+        "type": "object"
+      },
       "ApprovalDecisionType": {
         "enum": [
           "approve",
@@ -245,6 +307,107 @@
         ],
         "title": "ApprovalDecisionType",
         "type": "string"
+      },
+      "ApprovalEvidence": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "fact": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Fact",
+            "type": "string"
+          },
+          "object_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Object Id",
+            "type": "string"
+          },
+          "object_type": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Object Type",
+            "type": "string"
+          },
+          "source_system": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Source System",
+            "type": "string"
+          }
+        },
+        "required": [
+          "evidence_id",
+          "source_system",
+          "object_type",
+          "object_id",
+          "fact"
+        ],
+        "title": "ApprovalEvidence",
+        "type": "object"
+      },
+      "ApprovalQueueItem": {
+        "additionalProperties": false,
+        "properties": {
+          "approval": {
+            "$ref": "#/components/schemas/ApprovalRequest"
+          },
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_subject": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Case Subject",
+            "type": "string"
+          },
+          "cited_evidence": {
+            "items": {
+              "$ref": "#/components/schemas/ApprovalEvidence"
+            },
+            "title": "Cited Evidence",
+            "type": "array"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "case_id",
+          "case_subject",
+          "approval",
+          "cited_evidence"
+        ],
+        "title": "ApprovalQueueItem",
+        "type": "object"
+      },
+      "ApprovalQueuePage": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ApprovalQueueItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "ApprovalQueuePage",
+        "type": "object"
       },
       "ApprovalRequest": {
         "additionalProperties": false,

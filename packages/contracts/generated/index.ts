@@ -273,3 +273,36 @@ export interface RunArtifact {
   size_bytes: number;
   created_at: string;
 }
+
+export interface ApprovalDecisionRequest {
+  proposal_id: string;
+  proposal_hash: string;
+  decision: ApprovalDecisionType;
+  comment?: string | null;
+}
+
+export interface ApprovalEvidence {
+  evidence_id: string;
+  source_system: string;
+  object_type: string;
+  object_id: string;
+  fact: string;
+}
+
+export interface ApprovalQueueItem {
+  run_id: string;
+  case_id: string;
+  case_subject: string;
+  approval: ApprovalRequest;
+  cited_evidence: Array<ApprovalEvidence>;
+}
+
+export interface ApprovalQueuePage {
+  items: Array<ApprovalQueueItem>;
+}
+
+export interface ApprovalDecisionResponse {
+  run_id: string;
+  approval: ApprovalRequest;
+  idempotent_replay: boolean;
+}

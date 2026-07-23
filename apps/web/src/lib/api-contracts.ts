@@ -116,8 +116,76 @@ export const createRunResponseSchema = z.object({
   created_at: z.iso.datetime({ offset: true }),
 });
 
+export const proposalStatusSchema = z.enum([
+  "pending_approval",
+  "approved",
+  "rejected",
+  "blocked",
+  "executed",
+  "invalidated",
+]);
+
+export const approvalDecisionSchema = z.object({
+  proposal_id: z.uuid(),
+  proposal_hash: z.string().regex(/^[0-9a-f]{64}$/),
+  decision: z.enum(["approve", "reject"]),
+  comment: z.string().nullable().optional(),
+  decided_by: z.uuid(),
+  decided_at: z.iso.datetime({ offset: true }),
+});
+
+export const actionProposalSchema = z.object({
+  proposal_id: z.uuid(),
+  run_id: z.uuid(),
+  action_type: z.string(),
+  target_reference: z.string(),
+  canonical_parameters: z.record(z.string(), jsonValueSchema),
+  proposal_hash: z.string().regex(/^[0-9a-f]{64}$/),
+  risk_level: z.enum(["R0", "R1", "R2", "R3", "R4"]),
+  policy_key: z.string(),
+  policy_version: z.string(),
+  status: proposalStatusSchema,
+  idempotency_key: z.string(),
+  created_at: z.iso.datetime({ offset: true }),
+});
+
+export const approvalRequestSchema = z.object({
+  request_id: z.uuid(),
+  proposal: actionProposalSchema,
+  requested_by: z.uuid(),
+  requested_at: z.iso.datetime({ offset: true }),
+  decision: approvalDecisionSchema.nullable().optional(),
+});
+
+export const approvalQueueItemSchema = z.object({
+  run_id: z.uuid(),
+  case_id: z.uuid(),
+  case_subject: z.string(),
+  approval: approvalRequestSchema,
+  cited_evidence: z.array(
+    z.object({
+      evidence_id: z.string(),
+      source_system: z.string(),
+      object_type: z.string(),
+      object_id: z.string(),
+      fact: z.string(),
+    }),
+  ),
+});
+
+export const approvalQueuePageSchema = z.object({
+  items: z.array(approvalQueueItemSchema),
+});
+
+export const approvalDecisionResponseSchema = z.object({
+  run_id: z.uuid(),
+  approval: approvalRequestSchema,
+  idempotent_replay: z.boolean(),
+});
+
 export type PublicCase = z.infer<typeof publicCaseSchema>;
 export type WorkflowRun = z.infer<typeof workflowRunSchema>;
 export type WorkflowEvent = z.infer<typeof workflowEventSchema>;
 export type WorkflowEventType = z.infer<typeof workflowEventTypeSchema>;
 export type RunStatus = z.infer<typeof runStatusSchema>;
+export type ApprovalQueueItem = z.infer<typeof approvalQueueItemSchema>;

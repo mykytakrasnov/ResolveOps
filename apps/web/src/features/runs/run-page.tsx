@@ -21,9 +21,10 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { getCase } from "@/lib/api";
+import { getApproval, getCase } from "@/lib/api";
 
 import { ApprovalBadge, CategoryBadge } from "../cases/case-ui";
+import { ApprovalCard } from "./approval-card";
 import { RunTimeline } from "./run-timeline";
 import { formatDuration } from "./run-utils";
 import { useRunTimeline } from "./use-run-timeline";
@@ -47,12 +48,27 @@ function statusLabel(status: string) {
 
 export function RunPage() {
   const { runId = "" } = useParams();
-  const { run, events, connectionState, connectionError } =
-    useRunTimeline(runId);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const { run, events, connectionState, connectionError } = useRunTimeline(
+    runId,
+    refreshKey,
+  );
   const caseQuery = useQuery({
     queryKey: ["case", run?.case_id],
     queryFn: () => getCase(run?.case_id ?? ""),
     enabled: Boolean(run?.case_id),
+  });
+  const hasApproval =
+    run?.status === "waiting_for_approval" ||
+    events.some(
+      (event) =>
+        event.event_type === "approval.requested" ||
+        event.event_type === "approval.decided",
+    );
+  const approvalQuery = useQuery({
+    queryKey: ["approval", runId],
+    queryFn: () => getApproval(runId),
+    enabled: hasApproval,
   });
   const elapsed = useElapsed(
     run?.started_at ?? run?.created_at,
@@ -166,6 +182,12 @@ export function RunPage() {
             </span>
           </AlertDescription>
         </Alert>
+      ) : null}
+      {approvalQuery.data ? (
+        <ApprovalCard
+          item={approvalQuery.data}
+          onDecided={() => setRefreshKey((value) => value + 1)}
+        />
       ) : null}
 
       <div className="grid min-h-0 gap-6 lg:grid-cols-[minmax(0,1.7fr)_minmax(18rem,0.8fr)]">

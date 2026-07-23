@@ -19,16 +19,27 @@ from starlette.background import BackgroundTask
 from resolveops.graph.duplicate_charge import (
     execute_checkpointed_duplicate_charge_graph,
     execute_duplicate_charge_graph,
+    resume_checkpointed_duplicate_charge_graph,
 )
 from resolveops.models.contracts import (
+    ApprovalDecisionType,
     RunStatus,
     WorkflowEvent,
     WorkflowEventType,
     WorkflowOutcome,
     WorkflowRun,
 )
-from resolveops.models.run_api import CreateRunRequest, CreateRunResponse, WorkflowEventPage
+from resolveops.models.run_api import (
+    ApprovalDecisionRequest,
+    ApprovalDecisionResponse,
+    ApprovalQueueItem,
+    ApprovalQueuePage,
+    CreateRunRequest,
+    CreateRunResponse,
+    WorkflowEventPage,
+)
 from resolveops.repositories.runs import (
+    ApprovalDecisionConflictError,
     CaseNotFoundError,
     DatabaseRunRepository,
     ExecutionLease,
@@ -37,6 +48,7 @@ from resolveops.repositories.runs import (
     LostExecutionLeaseError,
     RunNotExecutableError,
     RunNotFoundError,
+    StaleProposalError,
 )
 from resolveops.storage.artifacts import ObjectStorage
 from resolveops.tools.read_only import ReadOnlyToolset
@@ -58,8 +70,16 @@ class Principal:
         return not self.roles.isdisjoint({"operator", "reviewer", "admin"})
 
     @property
+    def can_investigate(self) -> bool:
+        return not self.roles.isdisjoint({"operator", "admin"})
+
+    @property
     def can_access_all_runs(self) -> bool:
         return "admin" in self.roles
+
+    @property
+    def can_review(self) -> bool:
+        return not self.roles.isdisjoint({"reviewer", "admin"})
 
 
 @dataclass(frozen=True)
@@ -98,13 +118,47 @@ def require_repository(request: Request) -> DatabaseRunRepository:
 PrincipalDependency = Annotated[Principal, Depends(require_principal)]
 RepositoryDependency = Annotated[DatabaseRunRepository, Depends(require_repository)]
 
+
+def require_reviewer(principal: PrincipalDependency) -> Principal:
+    if not principal.can_review:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="reviewer access is required",
+        )
+    return principal
+
+
+def require_operator(principal: PrincipalDependency) -> Principal:
+    if not principal.can_investigate:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="operator access is required",
+        )
+    return principal
+
+
+ReviewerDependency = Annotated[Principal, Depends(require_reviewer)]
+OperatorDependency = Annotated[Principal, Depends(require_operator)]
+
 router = APIRouter(prefix="/api/v1/runs", tags=["runs"])
+
+
+@router.get("/approvals", response_model=ApprovalQueuePage)
+def list_approvals(
+    principal: ReviewerDependency,
+    repository: RepositoryDependency,
+    response: Response,
+) -> ApprovalQueuePage:
+    response.headers["Cache-Control"] = "no-store"
+    return ApprovalQueuePage(
+        items=repository.list_pending_approvals(organization_id=principal.organization_id)
+    )
 
 
 @router.post("", response_model=CreateRunResponse, status_code=status.HTTP_201_CREATED)
 def create_run(
     request: CreateRunRequest,
-    principal: PrincipalDependency,
+    principal: OperatorDependency,
     repository: RepositoryDependency,
     response: Response,
     idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
@@ -142,12 +196,198 @@ def get_run(
             run_id=run_id,
             organization_id=principal.organization_id,
             actor_user_id=principal.user_id,
-            allow_all=principal.can_access_all_runs,
+            allow_all=principal.can_access_all_runs or principal.can_review,
         )
     except RunNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
     response.headers["Cache-Control"] = "no-store"
     return run
+
+
+@router.get("/{run_id}/approval", response_model=ApprovalQueueItem)
+def get_approval(
+    run_id: UUID,
+    principal: ReviewerDependency,
+    repository: RepositoryDependency,
+    response: Response,
+) -> ApprovalQueueItem:
+    try:
+        approval = repository.get_approval(
+            run_id=run_id,
+            organization_id=principal.organization_id,
+        )
+    except RunNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    response.headers["Cache-Control"] = "no-store"
+    return approval
+
+
+@router.post("/{run_id}/decisions", response_model=ApprovalDecisionResponse)
+def decide_run(
+    run_id: UUID,
+    body: ApprovalDecisionRequest,
+    request: Request,
+    principal: ReviewerDependency,
+    repository: RepositoryDependency,
+    response: Response,
+    idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
+    accept: Annotated[str | None, Header()] = None,
+) -> ApprovalDecisionResponse | StreamingResponse:
+    read_tools = getattr(request.app.state, "read_tools", None)
+    object_storage = getattr(request.app.state, "object_storage", None)
+    checkpoint_dsn = getattr(request.app.state, "checkpoint_dsn", None)
+    if not isinstance(read_tools, ReadOnlyToolset):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="synthetic evidence tools are unavailable",
+        )
+    if not isinstance(object_storage, ObjectStorage):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="run artifact storage is unavailable",
+        )
+    if not isinstance(checkpoint_dsn, str) or not checkpoint_dsn:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="workflow checkpoint persistence is unavailable",
+        )
+    try:
+        recorded = repository.record_approval_decision(
+            run_id=run_id,
+            organization_id=principal.organization_id,
+            reviewer_user_id=principal.user_id,
+            proposal_id=body.proposal_id,
+            proposal_hash=body.proposal_hash,
+            decision=body.decision,
+            comment=body.comment,
+            idempotency_key=idempotency_key,
+            lease_seconds=LEASE_SECONDS,
+        )
+        if recorded.lease is not None:
+            _resume_decided_run(
+                repository=repository,
+                principal=principal,
+                lease=recorded.lease,
+                body=body,
+                read_tools=read_tools,
+                object_storage=object_storage,
+                checkpoint_dsn=checkpoint_dsn,
+            )
+    except RunNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except (StaleProposalError, ApprovalDecisionConflictError, IdempotencyConflictError) as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Idempotent-Replay"] = str(recorded.idempotent_replay).lower()
+    if accept and "text/event-stream" in accept.lower():
+        decision_events = repository.list_events(
+            run_id=run_id,
+            organization_id=principal.organization_id,
+            actor_user_id=principal.user_id,
+            after_sequence=0,
+            allow_all=True,
+        )
+        first_decision = next(
+            (
+                index
+                for index, event in enumerate(decision_events)
+                if event.event_type is WorkflowEventType.APPROVAL_DECIDED
+            ),
+            len(decision_events),
+        )
+        return StreamingResponse(
+            (_format_sse(event) for event in decision_events[first_decision:]),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "Idempotent-Replay": str(recorded.idempotent_replay).lower(),
+                "X-Accel-Buffering": "no",
+            },
+        )
+    return ApprovalDecisionResponse(
+        run_id=run_id,
+        approval=recorded.approval_request,
+        idempotent_replay=recorded.idempotent_replay,
+    )
+
+
+def _resume_decided_run(
+    *,
+    repository: DatabaseRunRepository,
+    principal: Principal,
+    lease: ExecutionLease,
+    body: ApprovalDecisionRequest,
+    read_tools: ReadOnlyToolset,
+    object_storage: ObjectStorage,
+    checkpoint_dsn: str,
+) -> None:
+    try:
+        existing_events = repository.list_events(
+            run_id=lease.run_id,
+            organization_id=principal.organization_id,
+            actor_user_id=principal.user_id,
+            after_sequence=0,
+            allow_all=True,
+        )
+        if not any(
+            event.event_type is WorkflowEventType.APPROVAL_DECIDED for event in existing_events
+        ):
+            repository.append_event(
+                lease=lease,
+                organization_id=principal.organization_id,
+                event_type=WorkflowEventType.APPROVAL_DECIDED,
+                node_name="approval_gate",
+                status=body.decision.value,
+                public_payload={
+                    "proposal_id": str(body.proposal_id),
+                    "proposal_hash": body.proposal_hash,
+                    "decision": body.decision.value,
+                    "comment_provided": bool(body.comment and body.comment.strip()),
+                },
+            )
+        asyncio.run(
+            resume_checkpointed_duplicate_charge_graph(
+                tools=read_tools,
+                persistence=repository,
+                object_storage=object_storage,
+                lease=lease,
+                organization_id=principal.organization_id,
+                decision=body.decision,
+                checkpoint_dsn=checkpoint_dsn,
+            )
+        )
+        if body.decision is ApprovalDecisionType.APPROVE:
+            repository.append_event(
+                lease=lease,
+                organization_id=principal.organization_id,
+                event_type=WorkflowEventType.NODE_STARTED,
+                node_name="execute_approved_action",
+                status="awaiting_execution",
+                public_payload={
+                    "summary": "Approved proposal is awaiting exactly-once execution.",
+                },
+                final_status=RunStatus.WAITING_FOR_APPROVAL,
+            )
+        else:
+            repository.append_event(
+                lease=lease,
+                organization_id=principal.organization_id,
+                event_type=WorkflowEventType.RUN_ESCALATED,
+                status="escalated",
+                public_payload={
+                    "summary": "Reviewer rejected the proposed action; no action was executed.",
+                    "reason_code": "reviewer_rejected",
+                    "report_status": "generated",
+                },
+                final_status=RunStatus.ESCALATED,
+            )
+    except Exception:
+        repository.release_execution_lease_for_retry(
+            lease=lease,
+            organization_id=principal.organization_id,
+        )
+        raise
 
 
 @router.get("/{run_id}/events", response_model=WorkflowEventPage)
@@ -164,7 +404,7 @@ def get_events(
             organization_id=principal.organization_id,
             actor_user_id=principal.user_id,
             after_sequence=after_sequence,
-            allow_all=principal.can_access_all_runs,
+            allow_all=principal.can_access_all_runs or principal.can_review,
         )
     except RunNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
@@ -180,7 +420,7 @@ def get_events(
 def execute_run(
     run_id: UUID,
     request: Request,
-    principal: PrincipalDependency,
+    principal: OperatorDependency,
     repository: RepositoryDependency,
     idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
 ) -> StreamingResponse:

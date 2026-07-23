@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol, cast
@@ -13,17 +13,19 @@ from uuid import UUID
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, JsonValue
 
 from resolveops.db.checkpoints import open_async_postgres_saver
 from resolveops.graph.state import DuplicateChargeState
 from resolveops.models.contracts import (
+    ApprovalDecisionType,
     ArtifactKind,
     CaseCategory,
     CaseClassification,
     EvidenceClaim,
     EvidenceItem,
+    EvidenceVerification,
     FinalResponse,
     InvestigationPlan,
     PolicyDecision,
@@ -128,6 +130,7 @@ class WorkflowPersistence(Protocol):
         lease: ExecutionLease,
         organization_id: UUID,
         decision: PolicyDecision,
+        cited_evidence_ids: Sequence[str] = (),
     ) -> ApprovalGateRecords: ...
 
 
@@ -402,7 +405,17 @@ def build_duplicate_charge_graph(
     graph.add_edge(ESCALATE_CASE, DRAFT_RESPONSE)
     graph.add_edge(DRAFT_RESPONSE, FINALIZE_RUN)
     graph.add_edge(FINALIZE_RUN, END)
-    graph.add_edge(APPROVAL_GATE, END)
+    if enable_approval_interrupt:
+        graph.add_conditional_edges(
+            APPROVAL_GATE,
+            _route_approval_decision,
+            {
+                ApprovalDecisionType.APPROVE.value: END,
+                ApprovalDecisionType.REJECT.value: ESCALATE_CASE,
+            },
+        )
+    else:
+        graph.add_edge(APPROVAL_GATE, END)
     return graph.compile(checkpointer=checkpointer)
 
 
@@ -526,6 +539,13 @@ async def execute_checkpointed_duplicate_charge_graph(
                 lease=lease,
                 organization_id=organization_id,
                 decision=decision,
+                cited_evidence_ids=(
+                    snapshot.values["evidence_verification"].validated_evidence_ids
+                    if isinstance(
+                        snapshot.values.get("evidence_verification"), EvidenceVerification
+                    )
+                    else ()
+                ),
             )
 
     return CheckpointedGraphExecution(
@@ -533,6 +553,82 @@ async def execute_checkpointed_duplicate_charge_graph(
         workflow_outcome=workflow_outcome,
         outcome_reason_code=decision.reason_code,
         approval_records=approval_records,
+    )
+
+
+async def resume_checkpointed_duplicate_charge_graph(
+    *,
+    tools: ReadOnlyToolset,
+    persistence: WorkflowPersistence,
+    object_storage: ObjectStorage,
+    lease: ExecutionLease,
+    organization_id: UUID,
+    decision: ApprovalDecisionType,
+    checkpoint_dsn: str,
+) -> CheckpointedGraphExecution:
+    """Resume only the stored approval interrupt with an authoritative persisted decision."""
+
+    config: dict[str, Any] = {"configurable": {"thread_id": str(lease.run_id)}}
+    events: list[WorkflowEvent] = []
+    workflow_outcome = (
+        WorkflowOutcome.APPROVAL_REQUIRED
+        if decision is ApprovalDecisionType.APPROVE
+        else WorkflowOutcome.ESCALATE
+    )
+    async with open_async_postgres_saver(checkpoint_dsn) as checkpointer:
+        graph = build_duplicate_charge_graph(
+            tools=tools,
+            persistence=persistence,
+            object_storage=object_storage,
+            lease=lease,
+            organization_id=organization_id,
+            checkpointer=checkpointer,
+            enable_approval_interrupt=True,
+        )
+        snapshot = await graph.aget_state(cast(Any, config))
+        has_interrupt = any(task.interrupts for task in snapshot.tasks)
+        if has_interrupt:
+            resume_input: Any = Command(resume=decision.value)
+        elif snapshot.next:
+            resume_input = None
+        else:
+            persisted_decision = snapshot.values.get("approval_decision")
+            if persisted_decision != decision:
+                raise RuntimeError("approval checkpoint is not resumable for this decision")
+            policy = snapshot.values.get("policy_decision")
+            if not isinstance(policy, PolicyDecision):
+                raise RuntimeError("resumed graph lost its policy decision")
+            return CheckpointedGraphExecution(
+                events=[],
+                workflow_outcome=workflow_outcome,
+                outcome_reason_code=policy.reason_code,
+            )
+        async for update in graph.astream(
+            resume_input,
+            config=cast(Any, config),
+            stream_mode="updates",
+        ):
+            for node_update in update.values():
+                if not isinstance(node_update, dict):
+                    continue
+                raw_outcome = node_update.get("workflow_outcome")
+                if isinstance(raw_outcome, WorkflowOutcome):
+                    workflow_outcome = raw_outcome
+                events.extend(
+                    event
+                    for event in node_update.get("emitted_events", [])
+                    if isinstance(event, WorkflowEvent)
+                )
+        resumed = await graph.aget_state(cast(Any, config))
+        if any(task.interrupts for task in resumed.tasks):
+            raise RuntimeError("approval checkpoint remained interrupted after resume")
+        policy = resumed.values.get("policy_decision")
+        if not isinstance(policy, PolicyDecision):
+            raise RuntimeError("resumed graph lost its policy decision")
+    return CheckpointedGraphExecution(
+        events=events,
+        workflow_outcome=workflow_outcome,
+        outcome_reason_code=policy.reason_code,
     )
 
 
@@ -818,7 +914,7 @@ def _request_approval(state: DuplicateChargeState) -> DuplicateChargeState:
 def _approval_gate_node() -> Callable[[DuplicateChargeState], DuplicateChargeState]:
     def node(state: DuplicateChargeState) -> DuplicateChargeState:
         decision = state["policy_decision"]
-        interrupt(
+        resumed = interrupt(
             {
                 "action_type": decision.action_type.value if decision.action_type else None,
                 "target_reference": decision.target_reference,
@@ -829,11 +925,26 @@ def _approval_gate_node() -> Callable[[DuplicateChargeState], DuplicateChargeSta
                 "reason_code": decision.reason_code,
             }
         )
-        # Resume and decision handling belong to a later issue. Even a caller that
-        # manually supplies a resume value cannot cross into action execution here.
-        raise RuntimeError("approval decision resume is not implemented")
+        approval_decision = ApprovalDecisionType(resumed)
+        return {
+            "approval_decision": approval_decision,
+            "workflow_outcome": (
+                WorkflowOutcome.APPROVAL_REQUIRED
+                if approval_decision is ApprovalDecisionType.APPROVE
+                else WorkflowOutcome.ESCALATE
+            ),
+            "workflow_reason_code": (
+                decision.reason_code
+                if approval_decision is ApprovalDecisionType.APPROVE
+                else "reviewer_rejected"
+            ),
+        }
 
     return node
+
+
+def _route_approval_decision(state: DuplicateChargeState) -> str:
+    return state["approval_decision"].value
 
 
 def _draft_response_node(
@@ -891,6 +1002,7 @@ def _deterministic_fallback_draft(
     outcome: WorkflowOutcome,
 ) -> FinalResponse:
     decision = state["policy_decision"]
+    reason_code = state.get("workflow_reason_code", decision.reason_code)
     verification = state["evidence_verification"]
     citations = verification.validated_evidence_ids
     if not citations:
@@ -904,7 +1016,7 @@ def _deterministic_fallback_draft(
         )
         internal_note = (
             "Deterministic duplicate-charge validation did not confirm a duplicate payment. "
-            f"Reason code: {decision.reason_code}. Evidence: {citation_text}."
+            f"Reason code: {reason_code}. Evidence: {citation_text}."
         )
         uncertainty = (
             "This conclusion is limited to the synthetic records available during this review; "
@@ -912,19 +1024,32 @@ def _deterministic_fallback_draft(
         )
     elif outcome is WorkflowOutcome.ESCALATE:
         missing = ", ".join(verification.missing_evidence_types) or "none identified"
-        body = (
-            "We could not verify the reported duplicate charge with enough synthetic evidence. "
-            "We have routed the case for specialist review and made no account change. "
-            f"Evidence available: {citation_text}."
-        )
-        internal_note = (
-            f"Escalated after deterministic review. Reason code: {decision.reason_code}. "
-            f"Missing evidence types: {missing}. Evidence: {citation_text}."
-        )
-        uncertainty = (
-            "The available synthetic records are incomplete or do not support a safe automated "
-            "conclusion; a specialist must verify the missing information."
-        )
+        if reason_code == "reviewer_rejected":
+            body = (
+                "The proposed synthetic account credit was not approved, so we made no account "
+                f"change and routed the case for specialist review. Evidence: {citation_text}."
+            )
+            internal_note = (
+                "Reviewer rejected the proposed action; no action was executed. "
+                f"Reason code: {reason_code}. Evidence: {citation_text}."
+            )
+            uncertainty = (
+                "A specialist must determine the next safe resolution after the reviewer decision."
+            )
+        else:
+            body = (
+                "We could not verify the reported duplicate charge with enough synthetic evidence. "
+                "We have routed the case for specialist review and made no account change. "
+                f"Evidence available: {citation_text}."
+            )
+            internal_note = (
+                f"Escalated after deterministic review. Reason code: {reason_code}. "
+                f"Missing evidence types: {missing}. Evidence: {citation_text}."
+            )
+            uncertainty = (
+                "The available synthetic records are incomplete or do not support a safe automated "
+                "conclusion; a specialist must verify the missing information."
+            )
     else:  # pragma: no cover - graph routing excludes approval-required drafting
         raise RuntimeError("approval-required outcomes cannot be drafted or finalized")
     return FinalResponse(
@@ -1008,7 +1133,7 @@ def _structured_report(state: DuplicateChargeState) -> dict[str, JsonValue]:
         "schema_version": "1.0",
         "run_id": str(state["run_id"]),
         "workflow_outcome": state["workflow_outcome"].value,
-        "reason_code": state["policy_decision"].reason_code,
+        "reason_code": state.get("workflow_reason_code", state["policy_decision"].reason_code),
         "final_response": cast(JsonValue, state["final_response"].model_dump(mode="json")),
         "evidence": cast(
             JsonValue,
@@ -1032,6 +1157,7 @@ def _structured_report(state: DuplicateChargeState) -> dict[str, JsonValue]:
 
 def _markdown_report(state: DuplicateChargeState) -> str:
     response = state["final_response"]
+    reason_code = state.get("workflow_reason_code", state["policy_decision"].reason_code)
     evidence_by_id = {item.evidence_id: item for item in state.get("evidence", [])}
     citations = "\n".join(
         f"- `{evidence_id}` — {evidence_by_id[evidence_id].fact}"
@@ -1040,7 +1166,7 @@ def _markdown_report(state: DuplicateChargeState) -> str:
     return (
         "# AtlasFlow billing investigation\n\n"
         f"Outcome: `{state['workflow_outcome'].value}`  \n"
-        f"Reason code: `{state['policy_decision'].reason_code}`\n\n"
+        f"Reason code: `{reason_code}`\n\n"
         "## Customer response\n\n"
         f"**{response.subject}**\n\n{response.body}\n\n"
         "## Internal note\n\n"

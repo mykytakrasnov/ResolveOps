@@ -61,10 +61,10 @@ def seed_local_database(database_url: str, generated_root: Path) -> int:
         cursor.execute(
             """
             INSERT INTO app.organization_memberships (organization_id, user_id, role)
-            VALUES (%s, %s, 'operator')
+            VALUES (%s, %s, 'operator'), (%s, %s, 'reviewer')
             ON CONFLICT DO NOTHING
             """,
-            (LOCAL_ORGANIZATION_ID, LOCAL_USER_ID),
+            (LOCAL_ORGANIZATION_ID, LOCAL_USER_ID, LOCAL_ORGANIZATION_ID, LOCAL_USER_ID),
         )
         for case in cases:
             cursor.execute(
@@ -100,7 +100,7 @@ def _local_principal() -> Principal:
     return Principal(
         organization_id=LOCAL_ORGANIZATION_ID,
         user_id=LOCAL_USER_ID,
-        roles=frozenset({"operator"}),
+        roles=frozenset({"operator", "reviewer"}),
     )
 
 

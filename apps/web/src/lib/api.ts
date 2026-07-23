@@ -1,6 +1,9 @@
 import type { z } from "zod";
 
 import {
+  approvalDecisionResponseSchema,
+  approvalQueueItemSchema,
+  approvalQueuePageSchema,
   createRunResponseSchema,
   publicCasePageSchema,
   publicCaseSchema,
@@ -103,6 +106,40 @@ export function getRunEvents(
     `/api/v1/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}`,
     workflowEventPageSchema,
     signal ? { signal } : undefined,
+  );
+}
+
+export function listApprovals() {
+  return requestJson("/api/v1/runs/approvals", approvalQueuePageSchema);
+}
+
+export function getApproval(runId: string) {
+  return requestJson(
+    `/api/v1/runs/${encodeURIComponent(runId)}/approval`,
+    approvalQueueItemSchema,
+  );
+}
+
+export function decideRun(
+  runId: string,
+  input: {
+    proposal_id: string;
+    proposal_hash: string;
+    decision: "approve" | "reject";
+    comment?: string;
+  },
+) {
+  return requestJson(
+    `/api/v1/runs/${encodeURIComponent(runId)}/decisions`,
+    approvalDecisionResponseSchema,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": crypto.randomUUID(),
+      },
+      body: JSON.stringify(input),
+    },
   );
 }
 

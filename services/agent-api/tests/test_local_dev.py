@@ -30,7 +30,9 @@ def test_load_public_cases_rejects_a_missing_dataset(tmp_path: Path) -> None:
         load_public_cases(tmp_path)
 
 
-def test_local_app_uses_a_bounded_synthetic_operator(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_local_app_uses_bounded_synthetic_operator_and_reviewer_roles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv(
         "DATABASE_URL_POOLED",
         "postgresql+psycopg://resolveops:resolveops@127.0.0.1:5432/resolveops",
@@ -41,4 +43,4 @@ def test_local_app_uses_a_bounded_synthetic_operator(monkeypatch: pytest.MonkeyP
 
     assert principal.organization_id == LOCAL_ORGANIZATION_ID
     assert principal.user_id == LOCAL_USER_ID
-    assert principal.roles == frozenset({"operator"})
+    assert principal.roles == frozenset({"operator", "reviewer"})

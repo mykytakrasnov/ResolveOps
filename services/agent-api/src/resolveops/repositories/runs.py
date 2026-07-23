@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -17,6 +18,8 @@ from pydantic import BaseModel, JsonValue
 
 from resolveops.models.contracts import (
     ActionProposal,
+    ApprovalDecision,
+    ApprovalDecisionType,
     ApprovalRequest,
     ArtifactKind,
     PolicyDecision,
@@ -31,6 +34,7 @@ from resolveops.models.contracts import (
     WorkflowEventType,
     WorkflowRun,
 )
+from resolveops.models.run_api import ApprovalEvidence, ApprovalQueueItem
 from resolveops.storage.artifacts import StoredObject
 
 GRAPH_VERSION = "1.0.0"
@@ -41,7 +45,7 @@ EVENT_PAGE_SIZE = 500
 DB_CONNECT_TIMEOUT_SECONDS = 5
 DB_STATEMENT_TIMEOUT_MILLISECONDS = 10_000
 DB_LOCK_TIMEOUT_MILLISECONDS = 5_000
-RECOVERABLE_RUN_ERROR_CODES = frozenset({"run_shell_failed", "approval_flow_not_implemented"})
+RECOVERABLE_RUN_ERROR_CODES = frozenset({"run_shell_failed"})
 
 
 class RunRepositoryError(Exception):
@@ -76,6 +80,14 @@ class ProposalReplayConflictError(RunRepositoryError):
     pass
 
 
+class StaleProposalError(RunRepositoryError):
+    pass
+
+
+class ApprovalDecisionConflictError(RunRepositoryError):
+    pass
+
+
 @dataclass(frozen=True)
 class CreatedRun:
     run: WorkflowRun
@@ -106,6 +118,14 @@ class RunCase:
 class ApprovalGateRecords:
     proposal: ActionProposal
     approval_request: ApprovalRequest
+    cited_evidence_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RecordedApprovalDecision:
+    approval_request: ApprovalRequest
+    idempotent_replay: bool
+    lease: ExecutionLease | None
 
 
 def _canonical_json(value: object) -> str:
@@ -292,6 +312,328 @@ class DatabaseRunRepository:
                 (run_id, after_sequence, EVENT_PAGE_SIZE),
             )
             return [_event_from_row(row) for row in cursor.fetchall()]
+
+    def list_pending_approvals(self, *, organization_id: UUID) -> list[ApprovalQueueItem]:
+        """List same-organization review work without applying run ownership rules."""
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT proposal.*, request.id AS request_id, request.requested_by,
+                       request.requested_at, request.decided_by, request.decision,
+                       request.comment, request.decided_at,
+                       run.case_id, support.subject AS case_subject
+                FROM app.approval_requests AS request
+                JOIN app.action_proposals AS proposal ON proposal.id = request.proposal_id
+                JOIN app.workflow_runs AS run ON run.id = proposal.run_id
+                JOIN app.support_cases AS support ON support.id = run.case_id
+                WHERE run.organization_id = %s
+                  AND run.status = 'waiting_for_approval'
+                  AND request.decision IS NULL
+                  AND proposal.status = 'pending_approval'
+                ORDER BY request.requested_at, request.id
+                """,
+                (organization_id,),
+            )
+            return [self._approval_queue_item(cursor, row) for row in cursor.fetchall()]
+
+    def get_approval(
+        self,
+        *,
+        run_id: UUID,
+        organization_id: UUID,
+    ) -> ApprovalQueueItem:
+        """Read reviewer details for any run in the reviewer's organization."""
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT proposal.*, request.id AS request_id, request.requested_by,
+                       request.requested_at, request.decided_by, request.decision,
+                       request.comment, request.decided_at,
+                       run.case_id, support.subject AS case_subject
+                FROM app.approval_requests AS request
+                JOIN app.action_proposals AS proposal ON proposal.id = request.proposal_id
+                JOIN app.workflow_runs AS run ON run.id = proposal.run_id
+                JOIN app.support_cases AS support ON support.id = run.case_id
+                WHERE run.id = %s AND run.organization_id = %s
+                """,
+                (run_id, organization_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise RunNotFoundError("approval request not found")
+            return self._approval_queue_item(cursor, row)
+
+    def _approval_queue_item(
+        self,
+        cursor: psycopg.Cursor[dict[str, Any]],
+        row: dict[str, Any],
+    ) -> ApprovalQueueItem:
+        proposal = _proposal_from_row(row)
+        approval = _approval_request_from_row(row, proposal=proposal)
+        cursor.execute(
+            """
+            SELECT public_payload
+            FROM audit.workflow_events
+            WHERE run_id = %s AND event_type = 'evidence.added'
+            ORDER BY sequence
+            """,
+            (proposal.run_id,),
+        )
+        all_evidence = []
+        for event_row in cursor.fetchall():
+            payload = event_row["public_payload"]
+            try:
+                all_evidence.append(
+                    ApprovalEvidence(
+                        evidence_id=payload["evidence_id"],
+                        source_system=payload["source_system"],
+                        object_type=payload["object_type"],
+                        object_id=payload["object_id"],
+                        fact=payload["fact"],
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        cursor.execute(
+            """
+            SELECT public_payload->'cited_evidence_ids' AS cited_evidence_ids
+            FROM audit.workflow_events
+            WHERE run_id = %s AND event_type = 'approval.requested'
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (proposal.run_id,),
+        )
+        citation_row = cursor.fetchone()
+        cited_ids = (
+            set(citation_row["cited_evidence_ids"])
+            if citation_row and isinstance(citation_row["cited_evidence_ids"], list)
+            else set()
+        )
+        evidence = [item for item in all_evidence if not cited_ids or item.evidence_id in cited_ids]
+        return ApprovalQueueItem(
+            run_id=proposal.run_id,
+            case_id=row["case_id"],
+            case_subject=row["case_subject"],
+            approval=approval,
+            cited_evidence=evidence,
+        )
+
+    def record_approval_decision(
+        self,
+        *,
+        run_id: UUID,
+        organization_id: UUID,
+        reviewer_user_id: UUID,
+        proposal_id: UUID,
+        proposal_hash: str,
+        decision: ApprovalDecisionType,
+        comment: str | None,
+        idempotency_key: UUID,
+        lease_seconds: int,
+    ) -> RecordedApprovalDecision:
+        """Persist an exact reviewer decision once, bound to an immutable proposal."""
+
+        normalized_comment = comment.strip() if comment and comment.strip() else None
+        if decision is ApprovalDecisionType.REJECT and normalized_comment is None:
+            raise ApprovalDecisionConflictError("comment is required when rejecting a proposal")
+        scope = f"run-decision:{organization_id}:{reviewer_user_id}"
+        request_hash = _sha256(
+            {
+                "run_id": str(run_id),
+                "proposal_id": str(proposal_id),
+                "proposal_hash": proposal_hash,
+                "decision": decision.value,
+                "comment": normalized_comment,
+            }
+        )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"{scope}:{idempotency_key}",),
+            )
+            cursor.execute(
+                """
+                SELECT request_hash, response_body
+                FROM app.idempotency_records
+                WHERE scope = %s AND key = %s AND expires_at > CURRENT_TIMESTAMP
+                """,
+                (scope, str(idempotency_key)),
+            )
+            replay = cursor.fetchone()
+            if replay is not None and replay["request_hash"] != request_hash:
+                raise IdempotencyConflictError(
+                    "the idempotency key was already used for a different request"
+                )
+
+            cursor.execute(
+                """
+                SELECT proposal.*, request.id AS request_id, request.requested_by,
+                       request.requested_at, request.decided_by, request.decision,
+                       request.comment, request.decided_at,
+                       run.status AS run_status,
+                       run.current_node AS run_current_node,
+                       run.execution_lease_until AS run_execution_lease_until
+                FROM app.approval_requests AS request
+                JOIN app.action_proposals AS proposal ON proposal.id = request.proposal_id
+                JOIN app.workflow_runs AS run ON run.id = proposal.run_id
+                WHERE run.id = %s AND run.organization_id = %s
+                FOR UPDATE OF request, proposal, run
+                """,
+                (run_id, organization_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise RunNotFoundError("approval request not found")
+            if row["id"] != proposal_id or row["proposal_hash"] != proposal_hash:
+                raise StaleProposalError("proposal is stale or does not match the active request")
+
+            existing_decision = row["decision"]
+            if existing_decision is not None:
+                if (
+                    existing_decision != decision.value
+                    or row["comment"] != normalized_comment
+                    or row["decided_by"] != reviewer_user_id
+                ):
+                    raise ApprovalDecisionConflictError(
+                        "the proposal already has a different reviewer decision"
+                    )
+                approval = _approval_request_from_row(row, proposal=_proposal_from_row(row))
+                if row["run_status"] == RunStatus.RUNNING.value:
+                    lease_token = uuid4()
+                    cursor.execute(
+                        """
+                        UPDATE app.workflow_runs
+                        SET execution_lease_token = %s,
+                            execution_lease_until =
+                                CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'),
+                            execution_attempt = execution_attempt + 1,
+                            version = version + 1
+                        WHERE id = %s AND organization_id = %s
+                          AND status = 'running'
+                          AND (
+                            execution_lease_until IS NULL
+                            OR execution_lease_until <= CURRENT_TIMESTAMP
+                          )
+                        RETURNING execution_attempt, execution_lease_until
+                        """,
+                        (lease_token, lease_seconds, run_id, organization_id),
+                    )
+                    recovered = cursor.fetchone()
+                    if recovered is not None:
+                        return RecordedApprovalDecision(
+                            approval_request=approval,
+                            idempotent_replay=True,
+                            lease=ExecutionLease(
+                                run_id=run_id,
+                                token=lease_token,
+                                attempt=recovered["execution_attempt"],
+                                expires_at=recovered["execution_lease_until"],
+                            ),
+                        )
+                    if row["run_execution_lease_until"] is None:
+                        raise ApprovalDecisionConflictError(
+                            "decided run could not reacquire its resume lease"
+                        )
+                elif not (
+                    row["run_status"] == RunStatus.WAITING_FOR_APPROVAL.value
+                    and row["run_current_node"] == "execute_approved_action"
+                    and decision is ApprovalDecisionType.APPROVE
+                ) and not (
+                    row["run_status"] == RunStatus.ESCALATED.value
+                    and decision is ApprovalDecisionType.REJECT
+                ):
+                    raise ApprovalDecisionConflictError(
+                        "decided run is not at a valid resume or terminal state"
+                    )
+                return RecordedApprovalDecision(
+                    approval_request=approval, idempotent_replay=True, lease=None
+                )
+
+            if row["status"] != ProposalStatus.PENDING_APPROVAL.value:
+                raise StaleProposalError("proposal is no longer pending approval")
+            cursor.execute(
+                """
+                UPDATE app.approval_requests
+                SET decision = %s, comment = %s, decided_by = %s, decided_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND decision IS NULL
+                RETURNING *
+                """,
+                (decision.value, normalized_comment, reviewer_user_id, row["request_id"]),
+            )
+            request_row = cursor.fetchone()
+            if request_row is None:
+                raise ApprovalDecisionConflictError("approval decision changed concurrently")
+            cursor.execute(
+                "UPDATE app.action_proposals SET status = %s WHERE id = %s",
+                (
+                    ProposalStatus.APPROVED.value
+                    if decision is ApprovalDecisionType.APPROVE
+                    else ProposalStatus.REJECTED.value,
+                    proposal_id,
+                ),
+            )
+            approval = _approval_request_from_row(
+                request_row,
+                proposal=_proposal_from_row(
+                    {
+                        **row,
+                        "status": ProposalStatus.APPROVED.value
+                        if decision is ApprovalDecisionType.APPROVE
+                        else ProposalStatus.REJECTED.value,
+                    }
+                ),
+            )
+            lease_token = uuid4()
+            cursor.execute(
+                """
+                UPDATE app.workflow_runs
+                SET execution_lease_token = %s,
+                    execution_lease_until = CURRENT_TIMESTAMP + (%s * INTERVAL '1 second'),
+                    execution_attempt = execution_attempt + 1,
+                    status = 'running',
+                    current_node = 'approval_gate',
+                    version = version + 1
+                WHERE id = %s AND organization_id = %s
+                  AND status = 'waiting_for_approval'
+                  AND execution_lease_until IS NULL
+                RETURNING execution_attempt, execution_lease_until
+                """,
+                (lease_token, lease_seconds, run_id, organization_id),
+            )
+            lease_row = cursor.fetchone()
+            if lease_row is None:
+                raise ApprovalDecisionConflictError("run cannot resume from its current state")
+            lease = ExecutionLease(
+                run_id=run_id,
+                token=lease_token,
+                attempt=lease_row["execution_attempt"],
+                expires_at=lease_row["execution_lease_until"],
+            )
+            cursor.execute(
+                """
+                INSERT INTO app.idempotency_records (
+                    scope, key, request_hash, response_status, response_body, expires_at
+                ) VALUES (
+                    %s, %s, %s, 200, %s,
+                    CURRENT_TIMESTAMP + (%s * INTERVAL '1 hour')
+                )
+                """,
+                (
+                    scope,
+                    str(idempotency_key),
+                    request_hash,
+                    Jsonb({"run_id": str(run_id), "proposal_id": str(proposal_id)}),
+                    IDEMPOTENCY_TTL_HOURS,
+                ),
+            )
+            return RecordedApprovalDecision(
+                approval_request=approval,
+                idempotent_replay=False,
+                lease=lease,
+            )
 
     def get_run_case(
         self,
@@ -665,6 +1007,29 @@ class DatabaseRunRepository:
                 )
             return _event_from_row(event_row)
 
+    def release_execution_lease_for_retry(
+        self,
+        *,
+        lease: ExecutionLease,
+        organization_id: UUID,
+    ) -> None:
+        """Release only the caller's fenced lease after a failed resume attempt."""
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE app.workflow_runs
+                SET execution_lease_token = NULL,
+                    execution_lease_until = NULL,
+                    version = version + 1
+                WHERE id = %s
+                  AND organization_id = %s
+                  AND execution_lease_token = %s
+                  AND status = 'running'
+                """,
+                (lease.run_id, organization_id, lease.token),
+            )
+
     def record_artifact(
         self,
         *,
@@ -755,6 +1120,7 @@ class DatabaseRunRepository:
         lease: ExecutionLease,
         organization_id: UUID,
         decision: PolicyDecision,
+        cited_evidence_ids: Sequence[str] = (),
     ) -> ApprovalGateRecords:
         """Persist one immutable policy-derived proposal and undecided request."""
 
@@ -878,6 +1244,7 @@ class DatabaseRunRepository:
             return ApprovalGateRecords(
                 proposal=proposal,
                 approval_request=_approval_request_from_row(request_row, proposal=proposal),
+                cited_evidence_ids=tuple(sorted(set(cited_evidence_ids))),
             )
 
     def mark_waiting_for_approval(
@@ -936,6 +1303,7 @@ class DatabaseRunRepository:
                 "risk_level": records.proposal.risk_level.value,
                 "policy_key": records.proposal.policy_key,
                 "policy_version": records.proposal.policy_version,
+                "cited_evidence_ids": list(records.cited_evidence_ids),
             },
             final_status=RunStatus.WAITING_FOR_APPROVAL,
         )
@@ -1117,12 +1485,20 @@ def _approval_request_from_row(
     *,
     proposal: ActionProposal,
 ) -> ApprovalRequest:
+    decision = None
     if row["decision"] is not None:
-        raise RunRepositoryError("decided approval requests are outside this workflow slice")
+        decision = ApprovalDecision(
+            proposal_id=proposal.proposal_id,
+            proposal_hash=proposal.proposal_hash,
+            decision=row["decision"],
+            comment=row["comment"],
+            decided_by=row["decided_by"],
+            decided_at=row["decided_at"],
+        )
     return ApprovalRequest(
-        request_id=row["id"],
+        request_id=row.get("request_id", row["id"]),
         proposal=proposal,
         requested_by=row["requested_by"],
         requested_at=row["requested_at"],
-        decision=None,
+        decision=decision,
     )

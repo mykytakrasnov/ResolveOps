@@ -5,6 +5,7 @@ import { AppShell } from "@/components/app-shell";
 import { CaseDetailPage } from "@/features/cases/case-detail-page";
 import { CaseInboxPage } from "@/features/cases/case-inbox-page";
 import { RunPage } from "@/features/runs/run-page";
+import { ReviewPage } from "@/features/review/review-page";
 
 export function createQueryClient() {
   return new QueryClient({
@@ -24,6 +25,7 @@ export function AppRoutes() {
         <Route path="/app/cases" element={<CaseInboxPage />} />
         <Route path="/app/cases/:caseId" element={<CaseDetailPage />} />
         <Route path="/app/runs/:runId" element={<RunPage />} />
+        <Route path="/app/review" element={<ReviewPage />} />
         <Route path="*" element={<Navigate to="/app/cases" replace />} />
       </Routes>
     </AppShell>

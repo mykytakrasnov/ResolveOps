@@ -15,7 +15,10 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 
-const navigation = [{ label: "Cases", href: "/app/cases", icon: TrayIcon }];
+const navigation = [
+  { label: "Cases", href: "/app/cases", icon: TrayIcon },
+  { label: "Review", href: "/app/review", icon: ShieldCheckIcon },
+];
 
 export function AppShell({ children }: { children: ReactNode }) {
   const location = useLocation();
